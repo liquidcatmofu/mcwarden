@@ -20,9 +20,11 @@ const (
 )
 
 type ExitStatus struct {
-	Code int
+	Code int `json:"code"`
 }
 
+// State and Wait must track the server JVM, including when a container wrapper
+// remains alive. Start success means process launch, not Minecraft readiness.
 // Runtime methods must honor context cancellation. Wait observes process exit;
 // a nonzero process exit code belongs in ExitStatus, not in the returned error.
 // Wait must support retry after a timeout, and must never target a replacement

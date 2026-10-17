@@ -25,6 +25,9 @@ func TestRun(t *testing.T) {
 		{[]string{"restart", "--kill", "--force", "--json"}, 5, true},
 		{[]string{"stop", "--stop-timeout=0s", "--json"}, 2, true},
 		{[]string{"stop", "--term"}, 2, false},
+		{[]string{"restart", "--no-wait", "--json"}, 5, true},
+		{[]string{"restart", "--start-timeout=0s", "--json"}, 2, true},
+		{[]string{"stop", "--no-wait"}, 2, false},
 		{[]string{"restart", "-y"}, 2, false},
 		{[]string{"status", "--json", "extra"}, 2, true},
 	} {

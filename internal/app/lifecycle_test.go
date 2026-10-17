@@ -59,7 +59,7 @@ func (f *fake) Wait(ctx context.Context) (runtime.ExitStatus, error) {
 }
 
 func TestRestart(t *testing.T) {
-	base := RestartOptions{StopTimeout: time.Millisecond, TermTimeout: time.Millisecond, KillTimeout: time.Millisecond}
+	base := RestartOptions{NoWait: true,StopTimeout: time.Millisecond, TermTimeout: time.Millisecond, KillTimeout: time.Millisecond}
 	tests := []struct {
 		name                            string
 		level                           Escalation
@@ -68,20 +68,20 @@ func TestRestart(t *testing.T) {
 		commandErr, signalErr, startErr error
 		wantErr                         error
 		wantCalls                       []string
-		wantPhases                      []Phase
+		wantEvents                      []Event
 	}{
-		{name: "graceful nonzero exit", wantCalls: []string{"state", "stop", "wait", "start"}, wantPhases: []Phase{StopRequested, Stopped, Started}},
-		{name: "stop only timeout", waits: []error{context.DeadlineExceeded}, wantErr: ErrTimeout, wantCalls: []string{"state", "stop", "wait"}, wantPhases: []Phase{StopRequested, StopTimedOut}},
-		{name: "term", level: WithTerm, waits: []error{context.DeadlineExceeded, nil}, wantCalls: []string{"state", "stop", "wait", "term", "wait", "start"}, wantPhases: []Phase{StopRequested, StopTimedOut, TermSent, Stopped, Started}},
-		{name: "term timeout", level: WithTerm, waits: []error{context.DeadlineExceeded, context.DeadlineExceeded}, wantErr: ErrTimeout, wantCalls: []string{"state", "stop", "wait", "term", "wait"}, wantPhases: []Phase{StopRequested, StopTimedOut, TermSent, TermTimedOut}},
-		{name: "kill", level: WithKill, force: true, waits: []error{context.DeadlineExceeded, context.DeadlineExceeded, nil}, wantCalls: []string{"state", "stop", "wait", "term", "wait", "kill", "wait", "start"}, wantPhases: []Phase{StopRequested, StopTimedOut, TermSent, TermTimedOut, KillSent, Stopped, Started}},
-		{name: "kill timeout", level: WithKill, force: true, waits: []error{context.DeadlineExceeded, context.DeadlineExceeded, context.DeadlineExceeded}, wantErr: ErrTimeout, wantCalls: []string{"state", "stop", "wait", "term", "wait", "kill", "wait"}, wantPhases: []Phase{StopRequested, StopTimedOut, TermSent, TermTimedOut, KillSent, KillTimedOut}},
-		{name: "kill needs force", level: WithKill, wantErr: ErrInvalid, wantPhases: []Phase{}},
-		{name: "command error", level: WithKill, force: true, commandErr: errTransport, wantErr: errTransport, wantCalls: []string{"state", "stop"}, wantPhases: []Phase{}},
-		{name: "command timeout is not wait timeout", level: WithKill, force: true, commandErr: ErrTimeout, wantErr: ErrTimeout, wantCalls: []string{"state", "stop"}, wantPhases: []Phase{}},
-		{name: "wait error", level: WithKill, force: true, waits: []error{errTransport}, wantErr: errTransport, wantCalls: []string{"state", "stop", "wait"}, wantPhases: []Phase{StopRequested}},
-		{name: "signal error", level: WithKill, force: true, waits: []error{context.DeadlineExceeded}, signalErr: ErrTimeout, wantErr: ErrTimeout, wantCalls: []string{"state", "stop", "wait", "term"}, wantPhases: []Phase{StopRequested, StopTimedOut}},
-		{name: "start error", startErr: errTransport, wantErr: errTransport, wantCalls: []string{"state", "stop", "wait", "start"}, wantPhases: []Phase{StopRequested, Stopped}},
+		{name: "graceful nonzero exit", wantCalls: []string{"state", "stop", "wait", "start"}, wantEvents: []Event{StopRequested, Stopped, StartRequested, ProcessStarted}},
+		{name: "stop only timeout", waits: []error{context.DeadlineExceeded}, wantErr: ErrTimeout, wantCalls: []string{"state", "stop", "wait"}, wantEvents: []Event{StopRequested, StopTimedOut}},
+		{name: "term", level: WithTerm, waits: []error{context.DeadlineExceeded, nil}, wantCalls: []string{"state", "stop", "wait", "term", "wait", "start"}, wantEvents: []Event{StopRequested, StopTimedOut, TermSent, Stopped, StartRequested, ProcessStarted}},
+		{name: "term timeout", level: WithTerm, waits: []error{context.DeadlineExceeded, context.DeadlineExceeded}, wantErr: ErrTimeout, wantCalls: []string{"state", "stop", "wait", "term", "wait"}, wantEvents: []Event{StopRequested, StopTimedOut, TermSent, TermTimedOut}},
+		{name: "kill", level: WithKill, force: true, waits: []error{context.DeadlineExceeded, context.DeadlineExceeded, nil}, wantCalls: []string{"state", "stop", "wait", "term", "wait", "kill", "wait", "start"}, wantEvents: []Event{StopRequested, StopTimedOut, TermSent, TermTimedOut, KillSent, Stopped, StartRequested, ProcessStarted}},
+		{name: "kill timeout", level: WithKill, force: true, waits: []error{context.DeadlineExceeded, context.DeadlineExceeded, context.DeadlineExceeded}, wantErr: ErrTimeout, wantCalls: []string{"state", "stop", "wait", "term", "wait", "kill", "wait"}, wantEvents: []Event{StopRequested, StopTimedOut, TermSent, TermTimedOut, KillSent, KillTimedOut}},
+		{name: "kill needs force", level: WithKill, wantErr: ErrInvalid, wantEvents: []Event{}},
+		{name: "command error", level: WithKill, force: true, commandErr: errTransport, wantErr: errTransport, wantCalls: []string{"state", "stop"}, wantEvents: []Event{}},
+		{name: "command timeout is not wait timeout", level: WithKill, force: true, commandErr: ErrTimeout, wantErr: ErrTimeout, wantCalls: []string{"state", "stop"}, wantEvents: []Event{}},
+		{name: "wait error", level: WithKill, force: true, waits: []error{errTransport}, wantErr: errTransport, wantCalls: []string{"state", "stop", "wait"}, wantEvents: []Event{StopRequested}},
+		{name: "signal error", level: WithKill, force: true, waits: []error{context.DeadlineExceeded}, signalErr: ErrTimeout, wantErr: ErrTimeout, wantCalls: []string{"state", "stop", "wait", "term"}, wantEvents: []Event{StopRequested, StopTimedOut}},
+		{name: "start error", startErr: errTransport, wantErr: errTransport, wantCalls: []string{"state", "stop", "wait", "start"}, wantEvents: []Event{StopRequested, Stopped, StartRequested}},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -96,8 +96,8 @@ func TestRestart(t *testing.T) {
 			if !reflect.DeepEqual(f.calls, tt.wantCalls) {
 				t.Errorf("calls = %v, want %v", f.calls, tt.wantCalls)
 			}
-			if !reflect.DeepEqual(result.Phases, tt.wantPhases) {
-				t.Errorf("phases = %v, want %v", result.Phases, tt.wantPhases)
+			if !reflect.DeepEqual(result.Events, tt.wantEvents) {
+				t.Errorf("phases = %v, want %v", result.Events, tt.wantEvents)
 			}
 		})
 	}
@@ -126,7 +126,7 @@ func TestRestartCancellationDoesNotEscalate(t *testing.T) {
 				f.waits = []error{context.DeadlineExceeded}
 				want = context.DeadlineExceeded
 			}
-			_, err := (Service{Runtime: f, Minecraft: f}).Restart(ctx, RestartOptions{StopTimeout: time.Second, TermTimeout: time.Second, KillTimeout: time.Second, Escalation: WithKill, AllowSIGKILL: true})
+			_, err := (Service{Runtime: f, Minecraft: f}).Restart(ctx, RestartOptions{NoWait: true, StopTimeout: time.Second, TermTimeout: time.Second, KillTimeout: time.Second, Escalation: WithKill, AllowSIGKILL: true})
 			if !errors.Is(err, want) {
 				t.Fatalf("error = %v", err)
 			}

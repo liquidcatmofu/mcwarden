@@ -19,6 +19,7 @@ Common options: --json
 Stop: --stop-timeout=120s
 Restart: --stop-timeout=120s --term [--term-timeout=30s]
          --kill --force [--kill-timeout=10s]
+         --start-timeout=120s [--no-wait]
 
 Runtime adapters are not yet included. Lifecycle commands require an adapter.
 `
@@ -54,12 +55,14 @@ func Run(ctx context.Context, args []string, out, stderr io.Writer, service app.
 	flags := flag.NewFlagSet(command, flag.ContinueOnError)
 	flags.SetOutput(stderr)
 	asJSON := flags.Bool("json", false, "emit JSON")
-	var stopTimeout, termTimeout, killTimeout time.Duration
-	var term, kill, force bool
+	var stopTimeout, termTimeout, killTimeout, startTimeout time.Duration
+	var term, kill, force, noWait bool
 	if command != "status" {
 		flags.DurationVar(&stopTimeout, "stop-timeout", 120*time.Second, "graceful stop timeout")
 	}
 	if command == "restart" {
+		flags.BoolVar(&noWait, "no-wait", false, "return after process launch without waiting for Minecraft startup")
+		flags.DurationVar(&startTimeout, "start-timeout", 120*time.Second, "Minecraft startup wait timeout")
 		flags.BoolVar(&term, "term", false, "send SIGTERM after graceful timeout")
 		flags.BoolVar(&kill, "kill", false, "escalate through SIGTERM to SIGKILL")
 		flags.BoolVar(&force, "force", false, "authorize SIGKILL (requires --kill)")
@@ -91,6 +94,7 @@ func Run(ctx context.Context, args []string, out, stderr io.Writer, service app.
 				escalation = app.WithKill
 			}
 			data, err = service.Restart(ctx, app.RestartOptions{
+				StartTimeout: startTimeout, NoWait: noWait,
 				StopTimeout: stopTimeout, TermTimeout: termTimeout, KillTimeout: killTimeout,
 				Escalation: escalation, AllowSIGKILL: force,
 			})
@@ -113,12 +117,12 @@ func Run(ctx context.Context, args []string, out, stderr io.Writer, service app.
 			var writeErr error
 			switch value := data.(type) {
 			case app.Status:
-				_, writeErr = fmt.Fprintf(out, "Runtime  %s\n", value.Runtime.State)
+				_, writeErr = fmt.Fprintf(out, "Runtime  %s\nMinecraft  %s\n", value.Runtime.State, value.Minecraft.State)
 				if writeErr == nil && value.Minecraft.Error != "" {
 					_, writeErr = fmt.Fprintf(out, "Minecraft  %s\n", value.Minecraft.Error)
 				}
 			case app.Result:
-				for _, phase := range value.Phases {
+				for _, phase := range value.Events {
 					if _, writeErr = fmt.Fprintln(out, phase); writeErr != nil {
 						break
 					}
