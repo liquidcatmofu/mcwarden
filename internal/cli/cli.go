@@ -24,20 +24,26 @@ Runtime adapters are not yet included. Lifecycle commands require an adapter.
 `
 
 type response struct {
-	Data any `json:"data,omitempty"`
-	Error string `json:"error,omitempty"`
-	ExitCode int `json:"exit_code"`
+	Data     any    `json:"data,omitempty"`
+	Error    string `json:"error,omitempty"`
+	ExitCode int    `json:"exit_code"`
 }
 
 func Run(ctx context.Context, args []string, out, stderr io.Writer, service app.Service) int {
-	if len(args) == 0 { _, err := io.WriteString(out, usage); return app.ExitCode(err) }
+	if len(args) == 0 {
+		_, err := io.WriteString(out, usage)
+		return app.ExitCode(err)
+	}
 	command := args[0]
 	if command == "help" || command == "--help" || command == "-h" {
 		_, err := io.WriteString(out, usage)
 		return app.ExitCode(err)
 	}
 	if command == "version" || command == "--version" {
-		if len(args) != 1 { fmt.Fprintln(stderr, "version accepts no arguments"); return 2 }
+		if len(args) != 1 {
+			fmt.Fprintln(stderr, "version accepts no arguments")
+			return 2
+		}
 		_, err := fmt.Fprintln(out, "mcwarden dev")
 		return app.ExitCode(err)
 	}
@@ -61,7 +67,9 @@ func Run(ctx context.Context, args []string, out, stderr io.Writer, service app.
 		flags.DurationVar(&killTimeout, "kill-timeout", 10*time.Second, "SIGKILL wait timeout")
 	}
 	if err := flags.Parse(args[1:]); err != nil {
-		if err == flag.ErrHelp { return 0 }
+		if err == flag.ErrHelp {
+			return 0
+		}
 		return 2
 	}
 	var data any
@@ -76,8 +84,12 @@ func Run(ctx context.Context, args []string, out, stderr io.Writer, service app.
 			data, err = service.Stop(ctx, app.StopOptions{Timeout: stopTimeout})
 		case "restart":
 			escalation := app.StopOnly
-			if term { escalation = app.WithTerm }
-			if kill { escalation = app.WithKill }
+			if term {
+				escalation = app.WithTerm
+			}
+			if kill {
+				escalation = app.WithKill
+			}
 			data, err = service.Restart(ctx, app.RestartOptions{
 				StopTimeout: stopTimeout, TermTimeout: termTimeout, KillTimeout: killTimeout,
 				Escalation: escalation, AllowSIGKILL: force,
@@ -87,22 +99,34 @@ func Run(ctx context.Context, args []string, out, stderr io.Writer, service app.
 	code := app.ExitCode(err)
 	if *asJSON {
 		result := response{Data: data, ExitCode: code}
-		if err != nil { result.Error = err.Error() }
-		if writeErr := json.NewEncoder(out).Encode(result); writeErr != nil { return app.ExitCode(writeErr) }
+		if err != nil {
+			result.Error = err.Error()
+		}
+		if writeErr := json.NewEncoder(out).Encode(result); writeErr != nil {
+			return app.ExitCode(writeErr)
+		}
 	} else {
-		if err != nil { fmt.Fprintln(stderr, err) }
+		if err != nil {
+			fmt.Fprintln(stderr, err)
+		}
 		if data != nil {
 			var writeErr error
 			switch value := data.(type) {
 			case app.Status:
 				_, writeErr = fmt.Fprintf(out, "Runtime  %s\n", value.Runtime.State)
-				if writeErr == nil && value.Minecraft.Error != "" { _, writeErr = fmt.Fprintf(out, "Minecraft  %s\n", value.Minecraft.Error) }
+				if writeErr == nil && value.Minecraft.Error != "" {
+					_, writeErr = fmt.Fprintf(out, "Minecraft  %s\n", value.Minecraft.Error)
+				}
 			case app.Result:
 				for _, phase := range value.Phases {
-					if _, writeErr = fmt.Fprintln(out, phase); writeErr != nil { break }
+					if _, writeErr = fmt.Fprintln(out, phase); writeErr != nil {
+						break
+					}
 				}
 			}
-			if writeErr != nil { return app.ExitCode(writeErr) }
+			if writeErr != nil {
+				return app.ExitCode(writeErr)
+			}
 		}
 	}
 	return code

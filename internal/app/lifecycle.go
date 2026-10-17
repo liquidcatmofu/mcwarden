@@ -25,10 +25,10 @@ type StopOptions struct {
 }
 
 type RestartOptions struct {
-	StopTimeout time.Duration
-	TermTimeout time.Duration
-	KillTimeout time.Duration
-	Escalation Escalation
+	StopTimeout  time.Duration
+	TermTimeout  time.Duration
+	KillTimeout  time.Duration
+	Escalation   Escalation
 	AllowSIGKILL bool
 }
 
@@ -36,13 +36,13 @@ type Phase string
 
 const (
 	StopRequested Phase = "stop_requested"
-	StopTimedOut Phase = "stop_timed_out"
-	TermSent Phase = "term_sent"
-	TermTimedOut Phase = "term_timed_out"
-	KillSent Phase = "kill_sent"
-	KillTimedOut Phase = "kill_timed_out"
-	Stopped Phase = "stopped"
-	Started Phase = "started"
+	StopTimedOut  Phase = "stop_timed_out"
+	TermSent      Phase = "term_sent"
+	TermTimedOut  Phase = "term_timed_out"
+	KillSent      Phase = "kill_sent"
+	KillTimedOut  Phase = "kill_timed_out"
+	Stopped       Phase = "stopped"
+	Started       Phase = "started"
 )
 
 // Result records completed transitions, including those preceding an error.
@@ -51,27 +51,47 @@ type Result struct {
 }
 
 type Service struct {
-	Runtime runtime.Runtime
+	Runtime   runtime.Runtime
 	Minecraft minecraft.Control
 }
 
 func (s Service) requireRunning(ctx context.Context) error {
-	if err := ctx.Err(); err != nil { return err }
-	if s.Runtime == nil { return ErrUnsupported }
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if s.Runtime == nil {
+		return ErrUnsupported
+	}
 	state, err := s.Runtime.State(ctx)
-	if err != nil { return fmt.Errorf("runtime state: %w", err) }
-	if state == runtime.Stopped { return ErrNotRunning }
-	if state != runtime.Running { return fmt.Errorf("runtime state is %q", state) }
+	if err != nil {
+		return fmt.Errorf("runtime state: %w", err)
+	}
+	if state == runtime.Stopped {
+		return ErrNotRunning
+	}
+	if state != runtime.Running {
+		return fmt.Errorf("runtime state is %q", state)
+	}
 	return nil
 }
 
 func (s Service) graceful(ctx context.Context, timeout time.Duration, result *Result) error {
-	if err := s.requireRunning(ctx); err != nil { return err }
-	if s.Minecraft == nil { return ErrUnsupported }
+	if err := s.requireRunning(ctx); err != nil {
+		return err
+	}
+	if s.Minecraft == nil {
+		return ErrUnsupported
+	}
 	caps, err := s.Minecraft.Capabilities(ctx)
-	if err != nil { return fmt.Errorf("minecraft capabilities: %w", err) }
-	if !caps.Command { return ErrUnsupported }
-	if err := ctx.Err(); err != nil { return err }
+	if err != nil {
+		return fmt.Errorf("minecraft capabilities: %w", err)
+	}
+	if !caps.Command {
+		return ErrUnsupported
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	if err := s.Minecraft.Command(ctx, "stop"); err != nil {
 		return fmt.Errorf("minecraft stop: %w", err)
 	}
@@ -84,7 +104,9 @@ func (s Service) wait(ctx context.Context, timeout time.Duration, result *Result
 	defer cancel()
 	_, err := s.Runtime.Wait(child)
 	// Parent cancellation/deadline is never a reason to escalate.
-	if ctx.Err() != nil { return ctx.Err() }
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
 	if err != nil {
 		if errors.Is(err, context.DeadlineExceeded) && child.Err() == context.DeadlineExceeded {
 			result.Phases = append(result.Phases, timedOut)
@@ -99,7 +121,9 @@ func (s Service) wait(ctx context.Context, timeout time.Duration, result *Result
 // Stop never sends OS signals, even on timeout or transport failure.
 func (s Service) Stop(ctx context.Context, opts StopOptions) (Result, error) {
 	result := Result{Phases: []Phase{}}
-	if opts.Timeout <= 0 { return result, fmt.Errorf("stop timeout must be positive: %w", ErrInvalid) }
+	if opts.Timeout <= 0 {
+		return result, fmt.Errorf("stop timeout must be positive: %w", ErrInvalid)
+	}
 	err := s.graceful(ctx, opts.Timeout, &result)
 	return result, err
 }
@@ -120,16 +144,26 @@ func (s Service) Restart(ctx context.Context, opts RestartOptions) (Result, erro
 	if errors.Is(err, errWaitTimeout) && ctx.Err() == nil && opts.Escalation == WithKill {
 		err = s.signalAndWait(ctx, runtime.Kill, KillSent, KillTimedOut, opts.KillTimeout, &result)
 	}
-	if err != nil { return result, err }
-	if err := ctx.Err(); err != nil { return result, err }
-	if err := s.Runtime.Start(ctx); err != nil { return result, fmt.Errorf("start: %w", err) }
+	if err != nil {
+		return result, err
+	}
+	if err := ctx.Err(); err != nil {
+		return result, err
+	}
+	if err := s.Runtime.Start(ctx); err != nil {
+		return result, fmt.Errorf("start: %w", err)
+	}
 	result.Phases = append(result.Phases, Started)
 	return result, nil
 }
 
 func (s Service) signalAndWait(ctx context.Context, signal runtime.Signal, sent, timedOut Phase, timeout time.Duration, result *Result) error {
-	if err := ctx.Err(); err != nil { return err }
-	if err := s.Runtime.Signal(ctx, signal); err != nil { return fmt.Errorf("send %s: %w", signal, err) }
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if err := s.Runtime.Signal(ctx, signal); err != nil {
+		return fmt.Errorf("send %s: %w", signal, err)
+	}
 	result.Phases = append(result.Phases, sent)
 	return s.wait(ctx, timeout, result, timedOut)
 }

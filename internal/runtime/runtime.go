@@ -16,7 +16,7 @@ type Signal string
 
 const (
 	Terminate Signal = "term"
-	Kill Signal = "kill"
+	Kill      Signal = "kill"
 )
 
 type ExitStatus struct {

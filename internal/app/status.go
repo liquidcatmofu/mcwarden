@@ -14,11 +14,11 @@ type RuntimeStatus struct {
 
 type MinecraftStatus struct {
 	Capabilities *minecraft.Capabilities `json:"capabilities"`
-	Error string `json:"error,omitempty"`
+	Error        string                  `json:"error,omitempty"`
 }
 
 type Status struct {
-	Runtime RuntimeStatus `json:"runtime"`
+	Runtime   RuntimeStatus   `json:"runtime"`
 	Minecraft MinecraftStatus `json:"minecraft"`
 }
 
@@ -26,17 +26,29 @@ type Status struct {
 // Failure to determine the runtime state is an error, not a healthy empty status.
 func (s Service) Status(ctx context.Context) (Status, error) {
 	status := Status{Runtime: RuntimeStatus{State: runtime.Unknown}}
-	if err := ctx.Err(); err != nil { return status, err }
-	if s.Runtime == nil { return status, ErrUnsupported }
+	if err := ctx.Err(); err != nil {
+		return status, err
+	}
+	if s.Runtime == nil {
+		return status, ErrUnsupported
+	}
 	state, err := s.Runtime.State(ctx)
-	if err != nil { return status, fmt.Errorf("runtime state: %w", err) }
+	if err != nil {
+		return status, fmt.Errorf("runtime state: %w", err)
+	}
 	status.Runtime.State = state
 	if s.Minecraft == nil {
 		status.Minecraft.Error = ErrUnsupported.Error()
 		return status, nil
 	}
 	caps, err := s.Minecraft.Capabilities(ctx)
-	if ctx.Err() != nil { return status, ctx.Err() }
-	if err != nil { status.Minecraft.Error = err.Error() } else { status.Minecraft.Capabilities = &caps }
+	if ctx.Err() != nil {
+		return status, ctx.Err()
+	}
+	if err != nil {
+		status.Minecraft.Error = err.Error()
+	} else {
+		status.Minecraft.Capabilities = &caps
+	}
 	return status, nil
 }
