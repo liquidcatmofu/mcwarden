@@ -1,0 +1,25 @@
+name: Go
+on:
+  push:
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: 'stable'
+          cache: false
+      - name: Format report
+        run: |
+          gofmt -w cmd internal
+          git diff --exit-code
+      - run: go vet ./...
+        if: success() || failure()
+      - run: go test -race -count=1 ./...
+        if: success() || failure()
+      - run: go build ./...
+        if: success() || failure()
