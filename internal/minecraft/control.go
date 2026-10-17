@@ -4,7 +4,7 @@ package minecraft
 import "context"
 
 type Capabilities struct {
-	Command bool `json:"command"`
+	Command   bool `json:"command"`
 	Readiness bool `json:"readiness"`
 }
 
@@ -20,11 +20,11 @@ type Control interface {
 type State string
 
 const (
- Unknown State = "unknown"
- Starting State = "starting"
- Running State = "running"
- Stopping State = "stopping"
- Stopped State = "stopped"
+	Unknown  State = "unknown"
+	Starting State = "starting"
+	Running  State = "running"
+	Stopping State = "stopping"
+	Stopped  State = "stopped"
 )
 
 // Observer is optional. State must honor cancellation and report observations
@@ -32,5 +32,5 @@ const (
 // must yield Unknown; process liveness alone does not establish Running.
 // The Readiness capability promises that this observer can detect startup completion.
 type Observer interface {
- State(context.Context) (State, error)
+	State(context.Context) (State, error)
 }

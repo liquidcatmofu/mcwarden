@@ -59,7 +59,7 @@ func (f *fake) Wait(ctx context.Context) (runtime.ExitStatus, error) {
 }
 
 func TestRestart(t *testing.T) {
-	base := RestartOptions{NoWait: true,StopTimeout: time.Millisecond, TermTimeout: time.Millisecond, KillTimeout: time.Millisecond}
+	base := RestartOptions{NoWait: true, StopTimeout: time.Millisecond, TermTimeout: time.Millisecond, KillTimeout: time.Millisecond}
 	tests := []struct {
 		name                            string
 		level                           Escalation

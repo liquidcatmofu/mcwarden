@@ -13,7 +13,7 @@ type RuntimeStatus struct {
 }
 
 type MinecraftStatus struct {
-	State minecraft.State `json:"state"`
+	State        minecraft.State         `json:"state"`
 	Capabilities *minecraft.Capabilities `json:"capabilities"`
 	Error        string                  `json:"error,omitempty"`
 }
@@ -38,7 +38,9 @@ func (s Service) Status(ctx context.Context) (Status, error) {
 		return status, fmt.Errorf("runtime state: %w", err)
 	}
 	status.Runtime.State = state
-	if state == runtime.Stopped { status.Minecraft.State = minecraft.Stopped }
+	if state == runtime.Stopped {
+		status.Minecraft.State = minecraft.Stopped
+	}
 	if s.Minecraft == nil {
 		status.Minecraft.Error = ErrUnsupported.Error()
 		return status, nil
@@ -51,11 +53,17 @@ func (s Service) Status(ctx context.Context) (Status, error) {
 		status.Minecraft.Error = err.Error()
 	} else {
 		status.Minecraft.Capabilities = &caps
-  if observer, ok := s.Minecraft.(minecraft.Observer); ok && state == runtime.Running {
-   observed, err := observer.State(ctx)
-   if ctx.Err() != nil { return status, ctx.Err() }
-   if err != nil { status.Minecraft.Error = err.Error() } else { status.Minecraft.State = observed }
-  }
+		if observer, ok := s.Minecraft.(minecraft.Observer); ok && state == runtime.Running {
+			observed, err := observer.State(ctx)
+			if ctx.Err() != nil {
+				return status, ctx.Err()
+			}
+			if err != nil {
+				status.Minecraft.Error = err.Error()
+			} else {
+				status.Minecraft.State = observed
+			}
+		}
 	}
 	return status, nil
 }

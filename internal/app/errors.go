@@ -8,12 +8,12 @@ import (
 
 var (
 	ErrStartupFailed = errors.New("server exited during startup")
-	ErrInvalid      = errors.New("invalid options")
-	ErrNotRunning   = errors.New("server not running")
-	ErrUnsupported  = errors.New("unsupported capability")
-	ErrTimeout      = errors.New("operation timed out")
-	ErrConfirmation = errors.New("confirmation required")
-	ErrExternal     = errors.New("external tool failed")
+	ErrInvalid       = errors.New("invalid options")
+	ErrNotRunning    = errors.New("server not running")
+	ErrUnsupported   = errors.New("unsupported capability")
+	ErrTimeout       = errors.New("operation timed out")
+	ErrConfirmation  = errors.New("confirmation required")
+	ErrExternal      = errors.New("external tool failed")
 )
 
 // ExitCode is shared by text and JSON CLI output.

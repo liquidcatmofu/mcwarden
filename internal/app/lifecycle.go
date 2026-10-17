@@ -26,7 +26,7 @@ type StopOptions struct {
 
 type RestartOptions struct {
 	StartTimeout time.Duration
-	NoWait bool
+	NoWait       bool
 	StopTimeout  time.Duration
 	TermTimeout  time.Duration
 	KillTimeout  time.Duration
@@ -37,26 +37,26 @@ type RestartOptions struct {
 type Event string
 
 const (
-	StopRequested Event = "stop_requested"
-	StopTimedOut  Event = "stop_timed_out"
-	TermSent      Event = "term_sent"
-	TermTimedOut  Event = "term_timed_out"
-	KillSent      Event = "kill_sent"
-	KillTimedOut  Event = "kill_timed_out"
-	Stopped       Event = "stopped"
-	StartRequested Event = "start_requested"
-	ProcessStarted Event = "process_started"
+	StopRequested    Event = "stop_requested"
+	StopTimedOut     Event = "stop_timed_out"
+	TermSent         Event = "term_sent"
+	TermTimedOut     Event = "term_timed_out"
+	KillSent         Event = "kill_sent"
+	KillTimedOut     Event = "kill_timed_out"
+	Stopped          Event = "stopped"
+	StartRequested   Event = "start_requested"
+	ProcessStarted   Event = "process_started"
 	StartupCompleted Event = "startup_completed"
-	StartupTimedOut Event = "startup_timed_out"
-	StartupExited Event = "startup_exited"
+	StartupTimedOut  Event = "startup_timed_out"
+	StartupExited    Event = "startup_exited"
 )
 
 // Result keeps operation events separate from the last observed lifecycle state.
 // A timeout does not establish process exit or cancel server startup.
 type Result struct {
-	Events []Event `json:"events"`
-	State minecraft.State `json:"state"`
-	Exit *runtime.ExitStatus `json:"exit,omitempty"`
+	Events []Event             `json:"events"`
+	State  minecraft.State     `json:"state"`
+	Exit   *runtime.ExitStatus `json:"exit,omitempty"`
 }
 
 type Service struct {
@@ -150,17 +150,26 @@ func (s Service) Restart(ctx context.Context, opts RestartOptions) (Result, erro
 		return result, fmt.Errorf("invalid restart timeout or escalation authorization: %w", ErrInvalid)
 	}
 
- // Check readiness support before stopping a working server.
- var observer minecraft.Observer
- if !opts.NoWait {
-  var ok bool
-  observer, ok = s.Minecraft.(minecraft.Observer)
-  if !ok { return result, ErrUnsupported }
-  caps, err := s.Minecraft.Capabilities(ctx)
-  if err != nil { return result, fmt.Errorf("minecraft capabilities: %w", err) }
-  if !caps.Readiness { return result, ErrUnsupported }
- }
- err := s.graceful(ctx, opts.StopTimeout, &result)
+	// Check readiness support before stopping a working server.
+	if err := ctx.Err(); err != nil {
+		return result, err
+	}
+	var observer minecraft.Observer
+	if !opts.NoWait {
+		var ok bool
+		observer, ok = s.Minecraft.(minecraft.Observer)
+		if !ok {
+			return result, ErrUnsupported
+		}
+		caps, err := s.Minecraft.Capabilities(ctx)
+		if err != nil {
+			return result, fmt.Errorf("minecraft capabilities: %w", err)
+		}
+		if !caps.Readiness {
+			return result, ErrUnsupported
+		}
+	}
+	err := s.graceful(ctx, opts.StopTimeout, &result)
 	if errors.Is(err, errWaitTimeout) && ctx.Err() == nil && opts.Escalation >= WithTerm {
 		err = s.signalAndWait(ctx, runtime.Terminate, TermSent, TermTimedOut, opts.TermTimeout, &result)
 	}
@@ -178,11 +187,13 @@ func (s Service) Restart(ctx context.Context, opts RestartOptions) (Result, erro
 		return result, fmt.Errorf("start: %w", err)
 	}
 	result.Events = append(result.Events, ProcessStarted)
- result.State = minecraft.Starting
- result.Exit = nil
- if opts.NoWait { return result, nil }
- err = s.awaitStartup(ctx, opts.StartTimeout, observer, &result)
- return result, err
+	result.State = minecraft.Starting
+	result.Exit = nil
+	if opts.NoWait {
+		return result, nil
+	}
+	err = s.awaitStartup(ctx, opts.StartTimeout, observer, &result)
+	return result, err
 }
 
 func (s Service) signalAndWait(ctx context.Context, signal runtime.Signal, sent, timedOut Event, timeout time.Duration, result *Result) error {
@@ -199,50 +210,69 @@ func (s Service) signalAndWait(ctx context.Context, signal runtime.Signal, sent,
 // awaitStartup observes both process exit and Minecraft readiness. No signals or
 // retries are issued on startup failure, timeout, observer error, or cancellation.
 func (s Service) awaitStartup(ctx context.Context, timeout time.Duration, observer minecraft.Observer, result *Result) error {
- child, cancel := context.WithTimeout(ctx, timeout)
- defer cancel()
- ticker := time.NewTicker(25 * time.Millisecond)
- defer ticker.Stop()
- finish := func(err error) error {
-  if ctx.Err() != nil { return ctx.Err() }
-  if child.Err() == context.DeadlineExceeded {
-   result.Events = append(result.Events, StartupTimedOut)
-   return fmt.Errorf("startup: %w", ErrTimeout)
-  }
-  return err
- }
- for {
-  if err := child.Err(); err != nil { return finish(err) }
-  state, err := s.Runtime.State(child)
-  if err != nil { return finish(fmt.Errorf("startup runtime state: %w", err)) }
-  if state == runtime.Stopped {
-   result.State = minecraft.Stopped
-   result.Events = append(result.Events, StartupExited)
-   exit, err := s.Runtime.Wait(child)
-   if err != nil { return finish(fmt.Errorf("startup exit: %w", err)) }
-   result.Exit = &exit
-   return fmt.Errorf("process exited before Minecraft startup completed (code %d): %w", exit.Code, ErrStartupFailed)
-  }
-  if state == runtime.Running {
-   mcState, err := observer.State(child)
-   if err != nil { return finish(fmt.Errorf("startup observation: %w", err)) }
-   if err := child.Err(); err != nil { return finish(err) }
-   if mcState == minecraft.Running {
-    // Recheck liveness after observation; never promote a known exited process.
-    state, err = s.Runtime.State(child)
-    if err != nil { return finish(fmt.Errorf("startup runtime state: %w", err)) }
-    if err := child.Err(); err != nil { return finish(err) }
-    if state == runtime.Running {
-     result.State = minecraft.Running
-     result.Events = append(result.Events, StartupCompleted)
-     return nil
-    }
-    if state == runtime.Stopped { continue }
-   }
-  }
-  select {
-  case <-child.Done(): return finish(child.Err())
-  case <-ticker.C:
-  }
- }
+	child, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	ticker := time.NewTicker(25 * time.Millisecond)
+	defer ticker.Stop()
+	finish := func(err error) error {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		if child.Err() == context.DeadlineExceeded {
+			result.Events = append(result.Events, StartupTimedOut)
+			return fmt.Errorf("startup: %w", ErrTimeout)
+		}
+		return err
+	}
+	for {
+		if err := child.Err(); err != nil {
+			return finish(err)
+		}
+		state, err := s.Runtime.State(child)
+		if err != nil {
+			return finish(fmt.Errorf("startup runtime state: %w", err))
+		}
+		if state == runtime.Stopped {
+			result.State = minecraft.Stopped
+			result.Events = append(result.Events, StartupExited)
+			exit, err := s.Runtime.Wait(child)
+			if err != nil {
+				return finish(fmt.Errorf("startup exit: %w", err))
+			}
+			result.Exit = &exit
+			return fmt.Errorf("process exited before Minecraft startup completed (code %d): %w", exit.Code, ErrStartupFailed)
+		}
+		if state == runtime.Running {
+			mcState, err := observer.State(child)
+			if err != nil {
+				return finish(fmt.Errorf("startup observation: %w", err))
+			}
+			if err := child.Err(); err != nil {
+				return finish(err)
+			}
+			if mcState == minecraft.Running {
+				// Recheck liveness after observation; never promote a known exited process.
+				state, err = s.Runtime.State(child)
+				if err != nil {
+					return finish(fmt.Errorf("startup runtime state: %w", err))
+				}
+				if err := child.Err(); err != nil {
+					return finish(err)
+				}
+				if state == runtime.Running {
+					result.State = minecraft.Running
+					result.Events = append(result.Events, StartupCompleted)
+					return nil
+				}
+				if state == runtime.Stopped {
+					continue
+				}
+			}
+		}
+		select {
+		case <-child.Done():
+			return finish(child.Err())
+		case <-ticker.C:
+		}
+	}
 }
