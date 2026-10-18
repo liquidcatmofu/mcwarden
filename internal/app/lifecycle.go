@@ -196,6 +196,19 @@ func (s Service) Restart(ctx context.Context, opts RestartOptions) (Result, erro
 	return result, err
 }
 
+func describeExit(exit runtime.ExitStatus) string {
+	switch {
+	case !exit.Known:
+		return "exit status unknown"
+	case exit.Signaled && exit.Signal != "":
+		return fmt.Sprintf("terminated by signal %s", exit.Signal)
+	case exit.Signaled:
+		return "terminated by signal"
+	default:
+		return fmt.Sprintf("exit code %d", exit.Code)
+	}
+}
+
 func (s Service) signalAndWait(ctx context.Context, signal runtime.Signal, sent, timedOut Event, timeout time.Duration, result *Result) error {
 	if err := ctx.Err(); err != nil {
 		return err
@@ -240,7 +253,7 @@ func (s Service) awaitStartup(ctx context.Context, timeout time.Duration, observ
 				return finish(fmt.Errorf("startup exit: %w", err))
 			}
 			result.Exit = &exit
-			return fmt.Errorf("process exited before Minecraft startup completed (code %d): %w", exit.Code, ErrStartupFailed)
+			return fmt.Errorf("process exited before Minecraft startup completed (%s): %w", describeExit(exit), ErrStartupFailed)
 		}
 		if state == runtime.Running {
 			mcState, err := observer.State(child)

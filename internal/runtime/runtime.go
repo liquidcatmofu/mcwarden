@@ -19,8 +19,16 @@ const (
 	Kill      Signal = "kill"
 )
 
+// ExitStatus reports how a process exited. Code is meaningful only when Known
+// is true; it is -1 when the process ended from a signal. Signaled reports
+// signal termination, and Signal names it when the adapter can map it. Known is
+// false when no exit status can be observed, such as for a process that was not
+// started as a child.
 type ExitStatus struct {
-	Code int `json:"code"`
+	Code     int    `json:"code"`
+	Known    bool   `json:"known"`
+	Signaled bool   `json:"signaled,omitempty"`
+	Signal   Signal `json:"signal,omitempty"`
 }
 
 // State and Wait must track the server JVM, including when a container wrapper
