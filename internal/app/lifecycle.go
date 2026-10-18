@@ -200,10 +200,10 @@ func describeExit(exit runtime.ExitStatus) string {
 	switch {
 	case !exit.Known:
 		return "exit status unknown"
-	case exit.Signaled && exit.Signal != "":
-		return fmt.Sprintf("terminated by signal %s", exit.Signal)
-	case exit.Signaled:
-		return "terminated by signal"
+	case exit.Signal != nil && exit.Signal.Name != "":
+		return fmt.Sprintf("terminated by signal %s", exit.Signal.Name)
+	case exit.Signal != nil:
+		return fmt.Sprintf("terminated by signal %d", exit.Signal.Number)
 	default:
 		return fmt.Sprintf("exit code %d", exit.Code)
 	}

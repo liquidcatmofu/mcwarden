@@ -7,6 +7,14 @@
 // same process generation. An already-running process can be adopted instead,
 // in which case its PID and start time are recorded so a reused PID is never
 // mistaken for the original.
+//
+// DirectRuntime tracks exactly one process and does not walk the process tree.
+// The configured command must therefore be the server JVM itself, or a wrapper
+// whose final step replaces itself with the JVM (for example ending in
+// "exec java ..."). A wrapper that spawns the JVM and exits first makes Wait
+// report process exit while the JVM may still be running, and a wrapper that
+// outlives the JVM keeps State reporting Running; neither matches the Runtime
+// contract of tracking the JVM.
 package direct
 
 import (
@@ -26,6 +34,10 @@ import (
 
 const adoptPollInterval = 100 * time.Millisecond
 
+// procRead reads a process snapshot. It is indirected so tests can inject
+// procfs failures.
+var procRead = hostlinux.Read
+
 var (
 	// ErrAlreadyRunning is returned when Start is called while a managed
 	// process is still alive.
@@ -35,13 +47,17 @@ var (
 	ErrNotStarted = errors.New("process is not running")
 	// ErrUnsupported is returned for a signal the adapter cannot translate.
 	ErrUnsupported = errors.New("unsupported operation")
+	// ErrInvalid is returned for an unusable configuration.
+	ErrInvalid = errors.New("invalid configuration")
 )
 
 // Adopt targets a process this Runtime did not start.
 type Adopt struct {
 	PID int
-	// StartTime, when nonzero, must match /proc/<pid>/stat. It guards against a
-	// reused PID being mistaken for the original process.
+	// StartTime is the /proc/<pid>/stat start time recorded when the PID was
+	// observed. It is required; it guards against a reused PID being mistaken
+	// for the original process. Callers that only know a PID should read its
+	// start time and construct Adopt from that PID and start time together.
 	StartTime uint64
 	// SignalGroup allows signals to reach the adopted process group. It stays
 	// off by default because the group may contain processes outside
@@ -52,6 +68,8 @@ type Adopt struct {
 // Config describes how to launch and observe a server process. It is read-only
 // after the Runtime is created.
 type Config struct {
+	// Path is the server JVM or a wrapper that ends by exec-ing the JVM. See
+	// the package comment for why a wrapper must not outlive the JVM.
 	Path string
 	Args []string
 	Dir  string
@@ -98,26 +116,46 @@ type process struct {
 	waitErr error
 }
 
-func (p *process) exited() bool {
+// gone reports whether the managed process is no longer running. For an owned
+// process this is the reaped state. For an adopted one it reads procfs and may
+// return an error; callers must not treat an unreadable process as gone.
+func (p *process) gone() (bool, error) {
 	if p.owned {
 		select {
 		case <-p.done:
-			return true
+			return true, nil
 		default:
-			return false
+			return false, nil
 		}
 	}
-	return !p.adoptedAlive()
+	alive, err := p.adoptedAlive()
+	if err != nil {
+		return false, err
+	}
+	return !alive, nil
 }
 
 // adoptedAlive reports whether the adopted process still exists and still
-// matches the recorded start time.
-func (p *process) adoptedAlive() bool {
-	stat, err := hostlinux.Read(p.pid)
-	if err != nil {
-		return false
+// matches the recorded start time. Only a missing process (ENOENT), a start
+// time mismatch, or a zombie/dead state counts as not alive; any other procfs
+// error is returned so the caller never mistakes an unreadable process for a
+// stopped one.
+func (p *process) adoptedAlive() (bool, error) {
+	stat, err := procRead(p.pid)
+	if errors.Is(err, os.ErrNotExist) {
+		return false, nil
 	}
-	return p.startTime == 0 || stat.StartTime == p.startTime
+	if err != nil {
+		return false, err
+	}
+	if stat.StartTime != p.startTime {
+		return false, nil
+	}
+	switch stat.State {
+	case 'Z', 'X':
+		return false, nil
+	}
+	return true, nil
 }
 
 // resolve returns the managed process, adopting the configured PID on first
@@ -131,14 +169,17 @@ func (r *Runtime) resolve() (*process, error) {
 	if r.cfg.Adopt == nil {
 		return nil, nil
 	}
-	stat, err := hostlinux.Read(r.cfg.Adopt.PID)
+	if r.cfg.Adopt.StartTime == 0 {
+		return nil, fmt.Errorf("adopt requires a start time: %w", ErrInvalid)
+	}
+	stat, err := procRead(r.cfg.Adopt.PID)
 	if errors.Is(err, os.ErrNotExist) {
 		return nil, nil
 	}
 	if err != nil {
 		return nil, fmt.Errorf("adopt pid %d: %w", r.cfg.Adopt.PID, err)
 	}
-	if r.cfg.Adopt.StartTime != 0 && stat.StartTime != r.cfg.Adopt.StartTime {
+	if stat.StartTime != r.cfg.Adopt.StartTime {
 		// A different process now holds the PID; never target it.
 		return nil, nil
 	}
@@ -161,8 +202,14 @@ func (r *Runtime) Start(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	if current != nil && !current.exited() {
-		return ErrAlreadyRunning
+	if current != nil {
+		gone, err := current.gone()
+		if err != nil {
+			return err
+		}
+		if !gone {
+			return ErrAlreadyRunning
+		}
 	}
 	if r.cfg.Path == "" {
 		return fmt.Errorf("start: command path is empty: %w", ErrUnsupported)
@@ -188,7 +235,7 @@ func (r *Runtime) Start(ctx context.Context) error {
 		cmd:   cmd,
 		done:  make(chan struct{}),
 	}
-	if stat, err := hostlinux.Read(next.pid); err == nil {
+	if stat, err := procRead(next.pid); err == nil {
 		next.startTime = stat.StartTime
 		next.pgid = stat.PGID
 	}
@@ -207,9 +254,8 @@ func (p *process) reap() {
 		var exitErr *exec.ExitError
 		if errors.As(err, &exitErr) {
 			if status, ok := exitErr.Sys().(syscall.WaitStatus); ok && status.Signaled() {
-				exit.Code = -1
-				exit.Signaled = true
-				exit.Signal = mapSignal(status.Signal())
+				exit.Signal = &runtime.ExitSignal{Number: int(status.Signal()), Name: signalName(status.Signal())}
+				exit.CoreDumped = status.CoreDump()
 			} else {
 				exit.Code = exitErr.ExitCode()
 			}
@@ -231,7 +277,14 @@ func (r *Runtime) State(ctx context.Context) (runtime.State, error) {
 	if err != nil {
 		return runtime.Unknown, err
 	}
-	if p == nil || p.exited() {
+	if p == nil {
+		return runtime.Stopped, nil
+	}
+	gone, err := p.gone()
+	if err != nil {
+		return runtime.Unknown, err
+	}
+	if gone {
 		return runtime.Stopped, nil
 	}
 	return runtime.Running, nil
@@ -252,7 +305,14 @@ func (r *Runtime) Signal(ctx context.Context, sig runtime.Signal) error {
 	if err != nil {
 		return err
 	}
-	if p == nil || p.exited() {
+	if p == nil {
+		return ErrNotStarted
+	}
+	gone, err := p.gone()
+	if err != nil {
+		return err
+	}
+	if gone {
 		return ErrNotStarted
 	}
 	target := p.pid
@@ -291,7 +351,11 @@ func (r *Runtime) Wait(ctx context.Context) (runtime.ExitStatus, error) {
 		if err := ctx.Err(); err != nil {
 			return runtime.ExitStatus{}, err
 		}
-		if !p.adoptedAlive() {
+		alive, err := p.adoptedAlive()
+		if err != nil {
+			return runtime.ExitStatus{}, err
+		}
+		if !alive {
 			// An adopted process is not a child, so no exit status is available.
 			return runtime.ExitStatus{Known: false}, nil
 		}
@@ -314,13 +378,42 @@ func nativeSignal(sig runtime.Signal) (syscall.Signal, error) {
 	}
 }
 
-func mapSignal(sig syscall.Signal) runtime.Signal {
-	switch sig {
-	case syscall.SIGTERM:
-		return runtime.Terminate
-	case syscall.SIGKILL:
-		return runtime.Kill
-	default:
-		return ""
-	}
+// signalNames maps terminating signals to their conventional names. Exit
+// causes are intentionally a wider set than the operation signals above, so a
+// crash is not silently reduced to SIGTERM or SIGKILL.
+var signalNames = map[syscall.Signal]string{
+	syscall.SIGHUP:    "SIGHUP",
+	syscall.SIGINT:    "SIGINT",
+	syscall.SIGQUIT:   "SIGQUIT",
+	syscall.SIGILL:    "SIGILL",
+	syscall.SIGTRAP:   "SIGTRAP",
+	syscall.SIGABRT:   "SIGABRT",
+	syscall.SIGBUS:    "SIGBUS",
+	syscall.SIGFPE:    "SIGFPE",
+	syscall.SIGKILL:   "SIGKILL",
+	syscall.SIGUSR1:   "SIGUSR1",
+	syscall.SIGSEGV:   "SIGSEGV",
+	syscall.SIGUSR2:   "SIGUSR2",
+	syscall.SIGPIPE:   "SIGPIPE",
+	syscall.SIGALRM:   "SIGALRM",
+	syscall.SIGTERM:   "SIGTERM",
+	syscall.SIGCHLD:   "SIGCHLD",
+	syscall.SIGCONT:   "SIGCONT",
+	syscall.SIGSTOP:   "SIGSTOP",
+	syscall.SIGTSTP:   "SIGTSTP",
+	syscall.SIGTTIN:   "SIGTTIN",
+	syscall.SIGTTOU:   "SIGTTOU",
+	syscall.SIGURG:    "SIGURG",
+	syscall.SIGXCPU:   "SIGXCPU",
+	syscall.SIGXFSZ:   "SIGXFSZ",
+	syscall.SIGVTALRM: "SIGVTALRM",
+	syscall.SIGPROF:   "SIGPROF",
+	syscall.SIGWINCH:  "SIGWINCH",
+	syscall.SIGIO:     "SIGIO",
+	syscall.SIGPWR:    "SIGPWR",
+	syscall.SIGSYS:    "SIGSYS",
+}
+
+func signalName(sig syscall.Signal) string {
+	return signalNames[sig]
 }

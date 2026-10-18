@@ -31,8 +31,10 @@ Runtimeの状態取得失敗はエラー。Minecraft側の取得失敗は部分�
 - `Start`は子プロセスを新しいプロセスグループで起動する。成功はプロセス起動を意味し、Minecraftの起動完了ではない。
 - 世代はPID・PGID・starttimeで識別し、`State`・`Signal`・`Wait`は同じ世代だけを対象にする。
 - `Signal`は自分で起動したプロセスにはプロセスグループへ送る。外部から採用したプロセスは既定でPID単体にだけ送り、`Adopt.SignalGroup`を明示した場合のみグループへ送る。
-- 既存プロセスは`Adopt{PID, StartTime}`で採用する。starttimeが一致しない場合はPID再利用とみなし、そのPIDを対象にしない。採用中は`Start`を拒否する。
+- 既存プロセスは`Adopt{PID, StartTime}`で採用する。`StartTime`は必須で、一致しない場合はPID再利用とみなして対象にしない。採用中は`Start`を拒否する。
 - `Wait`はタイムアウト後も再試行でき、同じ世代を観測する。採用したプロセスは子ではないため終了コードを取得できず、`Known=false`を返す。
-- 非0終了やシグナル終了はエラーにしない。`ExitStatus{Known, Signaled, Signal}`で表現する。シグナル終了時は`Code=-1`、`Signal`に`term`/`kill`が入る。
+- 非0終了やシグナル終了はエラーにしない。終了は`ExitStatus{Known, Code, Signal, CoreDumped}`で表す。`Signal`は終了原因専用の`ExitSignal{Number, Name}`とし、SIGSEGV(11)等の任意シグナルを失わない。操作要求用の`runtime.Signal{term, kill}`とは別型にする。
+- adopted processの生存判定は、ENOENT・starttime不一致・zombie/deadだけを終了とし、その他のprocfsエラーは`State`/`Signal`/`Wait`のエラーとして返す。読めないプロセスを停止済みと誤認して二重起動しないため。
+- `Config.Path`はJVM本体、または最後に`exec java ...`でJVMへ置き換わるwrapperを契約とする。process treeは探索せず、wrapperが先に終了する構成やJVMより長生きする構成は対象外。
 
 DirectProcessアダプターはまだCLIへ配線していない。TOML設定とserver selectionの後に配線する。

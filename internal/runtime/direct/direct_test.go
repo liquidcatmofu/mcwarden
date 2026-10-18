@@ -89,7 +89,7 @@ func TestStartWaitExitCode(t *testing.T) {
 	if err != nil {
 		t.Fatalf("wait: %v", err)
 	}
-	if !exit.Known || exit.Signaled || exit.Code != 7 {
+	if !exit.Known || exit.Signal != nil || exit.Code != 7 {
 		t.Fatalf("exit=%+v", exit)
 	}
 	if state, err := rt.State(ctx); err != nil || state != runtime.Stopped {
@@ -140,7 +140,7 @@ func TestWaitRetryAfterTimeout(t *testing.T) {
 	if err != nil {
 		t.Fatalf("retry wait: %v", err)
 	}
-	if !exit.Known || !exit.Signaled || exit.Signal != runtime.Terminate || exit.Code != -1 {
+	if !exit.Known || exit.Signal == nil || exit.Signal.Name != "SIGTERM" || exit.Signal.Number != int(syscall.SIGTERM) || exit.CoreDumped {
 		t.Fatalf("exit=%+v", exit)
 	}
 }
@@ -178,7 +178,7 @@ func TestTerminateThenKill(t *testing.T) {
 	if err != nil {
 		t.Fatalf("wait: %v", err)
 	}
-	if !exit.Known || !exit.Signaled || exit.Signal != runtime.Kill || exit.Code != -1 {
+	if !exit.Known || exit.Signal == nil || exit.Signal.Name != "SIGKILL" || exit.Signal.Number != int(syscall.SIGKILL) {
 		t.Fatalf("exit=%+v", exit)
 	}
 }
@@ -273,6 +273,45 @@ func TestAdoptRejectsChangedStartTime(t *testing.T) {
 	}
 	if _, err := hostlinux.Read(pid); err != nil {
 		t.Fatalf("mismatched adopt signalled another process: %v", err)
+	}
+}
+
+func TestAdoptRequiresStartTime(t *testing.T) {
+	rt := direct.New(direct.Config{Adopt: &direct.Adopt{PID: os.Getpid()}})
+	if _, err := rt.State(context.Background()); !errors.Is(err, direct.ErrInvalid) {
+		t.Fatalf("err=%v", err)
+	}
+}
+
+// TestAdoptTreatsZombieAsStopped verifies that an exited but unreaped process is
+// reported as stopped rather than running forever.
+func TestAdoptTreatsZombieAsStopped(t *testing.T) {
+	cmd := exec.Command(os.Args[0], "-test.run=TestHelperProcess")
+	cmd.Env = append(os.Environ(), "MCWARDEN_DIRECT_HELPER=1", "MCWARDEN_DIRECT_MODE=exit", "MCWARDEN_DIRECT_CODE=0")
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	defer cmd.Wait()
+
+	deadline := time.Now().Add(5 * time.Second)
+	var stat hostlinux.Process
+	for {
+		got, err := hostlinux.Read(cmd.Process.Pid)
+		if err == nil && got.State == 'Z' {
+			stat = got
+			break
+		}
+		if time.Now().After(deadline) {
+			cmd.Process.Kill()
+			t.Fatalf("process did not become a zombie: %v", err)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	rt := direct.New(direct.Config{Adopt: &direct.Adopt{PID: stat.PID, StartTime: stat.StartTime}})
+	if state, err := rt.State(context.Background()); err != nil || state != runtime.Stopped {
+		t.Fatalf("state=%s err=%v", state, err)
 	}
 }
 
