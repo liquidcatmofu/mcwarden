@@ -19,8 +19,24 @@ const (
 	Kill      Signal = "kill"
 )
 
+// ExitSignal identifies the signal that terminated a process. Number is the raw
+// signal number and Name is its conventional name, for example 11 and SIGSEGV.
+// It describes an exit cause, not an operation request, so it is independent of
+// Signal.
+type ExitSignal struct {
+	Number int    `json:"number"`
+	Name   string `json:"name"`
+}
+
+// ExitStatus reports how a process exited. Known is false when no exit status
+// can be observed, such as for a process that was not started as a child. When
+// the process ended from a signal, Signal is set and Code is zero. CoreDumped is
+// set when the terminating signal produced a core dump.
 type ExitStatus struct {
-	Code int `json:"code"`
+	Known      bool        `json:"known"`
+	Code       int         `json:"code,omitempty"`
+	Signal     *ExitSignal `json:"signal,omitempty"`
+	CoreDumped bool        `json:"core_dumped,omitempty"`
 }
 
 // State and Wait must track the server JVM, including when a container wrapper
