@@ -4,10 +4,15 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"testing"
 
 	"github.com/liquidcatmofu/mcwarden/internal/app"
 )
+
+func staticService(service app.Service) Loader {
+	return func(string, string) (app.Service, error) { return service, nil }
+}
 
 func TestRun(t *testing.T) {
 	for _, tt := range []struct {
@@ -33,7 +38,7 @@ func TestRun(t *testing.T) {
 	} {
 		t.Run(join(tt.args), func(t *testing.T) {
 			var out, stderr bytes.Buffer
-			code := Run(context.Background(), tt.args, &out, &stderr, app.Service{})
+			code := Run(context.Background(), tt.args, &out, &stderr, staticService(app.Service{}))
 			if code != tt.code {
 				t.Fatalf("code=%d want=%d stdout=%s stderr=%s", code, tt.code, &out, &stderr)
 			}
@@ -47,6 +52,74 @@ func TestRun(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestGlobalFlagsAcceptBothPositions(t *testing.T) {
+	cases := [][]string{
+		{"-c", "/tmp/mc.toml", "-s", "rail", "status", "--json"},
+		{"status", "-c", "/tmp/mc.toml", "-s", "rail", "--json"},
+		{"--config=/tmp/mc.toml", "--server=rail", "status", "--json"},
+		{"--json", "--server", "rail", "--config", "/tmp/mc.toml", "status"},
+	}
+	for _, args := range cases {
+		t.Run(join(args), func(t *testing.T) {
+			var gotConfig, gotServer string
+			load := func(configPath, serverName string) (app.Service, error) {
+				gotConfig, gotServer = configPath, serverName
+				return app.Service{}, nil
+			}
+			var out, stderr bytes.Buffer
+			code := Run(context.Background(), args, &out, &stderr, load)
+			if code != 5 {
+				t.Fatalf("code=%d stderr=%s", code, &stderr)
+			}
+			if gotConfig != "/tmp/mc.toml" || gotServer != "rail" {
+				t.Fatalf("config=%q server=%q", gotConfig, gotServer)
+			}
+			if stderr.Len() != 0 {
+				t.Fatalf("stderr=%s", &stderr)
+			}
+		})
+	}
+}
+
+func TestGlobalFlagMissingValue(t *testing.T) {
+	var out, stderr bytes.Buffer
+	code := Run(context.Background(), []string{"status", "-c"}, &out, &stderr, staticService(app.Service{}))
+	if code != 2 || stderr.Len() == 0 {
+		t.Fatalf("code=%d stderr=%s", code, &stderr)
+	}
+}
+
+func TestLoaderError(t *testing.T) {
+	load := func(string, string) (app.Service, error) {
+		return app.Service{}, fmt.Errorf("%w: boom", app.ErrConfig)
+	}
+	var out, stderr bytes.Buffer
+	code := Run(context.Background(), []string{"status", "--json"}, &out, &stderr, load)
+	if code != 2 || stderr.Len() != 0 {
+		t.Fatalf("code=%d stderr=%s", code, &stderr)
+	}
+	var result response
+	if err := json.Unmarshal(out.Bytes(), &result); err != nil {
+		t.Fatal(err)
+	}
+	if result.ExitCode != 2 || result.Error == "" {
+		t.Fatalf("response=%+v", result)
+	}
+}
+
+func TestHelpAndVersionSkipLoader(t *testing.T) {
+	load := func(string, string) (app.Service, error) {
+		t.Fatal("loader must not be called")
+		return app.Service{}, nil
+	}
+	for _, args := range [][]string{{"help"}, {"--help"}, {"-h"}, {"version"}} {
+		var out, stderr bytes.Buffer
+		if code := Run(context.Background(), args, &out, &stderr, load); code != 0 {
+			t.Fatalf("%v: code=%d stderr=%s", args, code, &stderr)
+		}
 	}
 }
 

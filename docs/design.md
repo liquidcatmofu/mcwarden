@@ -22,7 +22,20 @@ Runtimeの状態取得失敗はエラー。Minecraft側の取得失敗は部分�
 
 終了コードは0=成功、1=一般エラー、2=引数不正、3=停止中、4=タイムアウト、5=非対応、6=権限不足、9=確認必要、10=外部ツール失敗、130=キャンセル。7/8のhealth判定は未実装。
 
-`-i`・`-y`・確認UI、TOML設定、実アダプター、health判定、監視・バックアップ、パッケージマネージャー連携は次の段階。`-y`は将来もシグナル送信の許可には使わない。CLIの引数解析エラーはstderr、正常に解析できた`--json`操作の結果はstdoutへJSONで出す。
+`-i`・`-y`・確認UI、実Minecraft adapter、health判定、監視・バックアップ、パッケージマネージャー連携は次の段階。`-y`は将来もシグナル送信の許可には使わない。CLIの引数解析エラーはstderr、正常に解析できた`--json`操作の結果はstdoutへJSONで出す。
+
+## 設定とserver selection
+
+`internal/config`がTOMLを読み、`internal/bootstrap`が選択したserverから`app.Service`を組み立てる。
+
+- 既定パスは`${XDG_CONFIG_HOME:-~/.config}/mcwarden/config.toml`。`-c/--config`で上書きする。
+- `-s/--server`、`default_server`、唯一のserverの順に選択する。複数あって指定が無ければエラー。
+- `-c`・`-s`・`--json`はコマンドの前後どちらでも置ける。`--`以降はグローバル解析の対象外。
+- 未知のTOMLキーはエラーにする。設定のtypoを黙って無視しないため。
+- `runtime`は`direct`（既定）と`podman`。`podman`は既知だが未実装として終了コード5を返す。
+- `direct.env`は親環境への追加として扱い、同名キーは設定側が上書きする。
+- `direct.pidfile`がある場合、内容の`PID`または`PID STARTTIME`から`Adopt`を作る。STARTTIME省略時はその場でprocfsを読み、その時点のstarttimeを固定する。pidfileやプロセスが無ければ「未起動」として採用しない。
+- 設定エラーは終了コード2。TOML読み込みに`github.com/BurntSushi/toml`を使う。
 
 ## DirectProcessアダプター
 
@@ -37,4 +50,4 @@ Runtimeの状態取得失敗はエラー。Minecraft側の取得失敗は部分�
 - adopted processの生存判定は、ENOENT・starttime不一致・zombie/deadだけを終了とし、その他のprocfsエラーは`State`/`Signal`/`Wait`のエラーとして返す。読めないプロセスを停止済みと誤認して二重起動しないため。
 - `Config.Path`はJVM本体、または最後に`exec java ...`でJVMへ置き換わるwrapperを契約とする。process treeは探索せず、wrapperが先に終了する構成やJVMより長生きする構成は対象外。
 
-DirectProcessアダプターはまだCLIへ配線していない。TOML設定とserver selectionの後に配線する。
+DirectProcessアダプターはCLIへ配線済みで、`status`は設定したserverを対象に動作する。Minecraft側のcontrol/readiness adapterが未実装のため、`stop`/`restart`は終了コード5を返す。
