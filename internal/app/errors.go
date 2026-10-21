@@ -9,6 +9,7 @@ import (
 var (
 	ErrStartupFailed = errors.New("server exited during startup")
 	ErrInvalid       = errors.New("invalid options")
+	ErrConfig        = errors.New("configuration error")
 	ErrNotRunning    = errors.New("server not running")
 	ErrUnsupported   = errors.New("unsupported capability")
 	ErrTimeout       = errors.New("operation timed out")
@@ -21,7 +22,7 @@ func ExitCode(err error) int {
 	switch {
 	case err == nil:
 		return 0
-	case errors.Is(err, ErrInvalid):
+	case errors.Is(err, ErrInvalid), errors.Is(err, ErrConfig):
 		return 2
 	case errors.Is(err, ErrNotRunning):
 		return 3

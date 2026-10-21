@@ -7,22 +7,29 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/liquidcatmofu/mcwarden/internal/app"
 )
 
-const usage = `Usage: mcwarden <command> [options]
+const usage = `Usage: mcwarden [global options] <command> [options]
 
 Commands: status, stop, restart, version, help
-Common options: --json
+Global options: -c, --config <path>  -s, --server <name>  --json
 Stop: --stop-timeout=120s
 Restart: --stop-timeout=120s --term [--term-timeout=30s]
          --kill --force [--kill-timeout=10s]
          --start-timeout=120s [--no-wait]
 
-Runtime adapters are not yet included. Lifecycle commands require an adapter.
+Global options may appear before or after the command.
+Runtime adapters are configured through TOML; Minecraft control is not yet wired.
 `
+
+// Loader builds the service for a selected server. An empty configPath means
+// the default location, and an empty serverName means the configured default.
+type Loader func(configPath, serverName string) (app.Service, error)
 
 type response struct {
 	Data     any    `json:"data,omitempty"`
@@ -30,18 +37,29 @@ type response struct {
 	ExitCode int    `json:"exit_code"`
 }
 
-func Run(ctx context.Context, args []string, out, stderr io.Writer, service app.Service) int {
-	if len(args) == 0 {
+type globalOptions struct {
+	config string
+	server string
+	json   bool
+}
+
+func Run(ctx context.Context, args []string, out, stderr io.Writer, load Loader) int {
+	globals, rest, err := parseGlobals(args)
+	if err != nil {
+		fmt.Fprintln(stderr, err)
+		return app.ExitCode(err)
+	}
+	if len(rest) == 0 {
 		_, err := io.WriteString(out, usage)
 		return app.ExitCode(err)
 	}
-	command := args[0]
+	command := rest[0]
 	if command == "help" || command == "--help" || command == "-h" {
 		_, err := io.WriteString(out, usage)
 		return app.ExitCode(err)
 	}
 	if command == "version" || command == "--version" {
-		if len(args) != 1 {
+		if len(rest) != 1 {
 			fmt.Fprintln(stderr, "version accepts no arguments")
 			return 2
 		}
@@ -69,39 +87,43 @@ func Run(ctx context.Context, args []string, out, stderr io.Writer, service app.
 		flags.DurationVar(&termTimeout, "term-timeout", 30*time.Second, "SIGTERM wait timeout")
 		flags.DurationVar(&killTimeout, "kill-timeout", 10*time.Second, "SIGKILL wait timeout")
 	}
-	if err := flags.Parse(args[1:]); err != nil {
+	if err := flags.Parse(rest[1:]); err != nil {
 		if err == flag.ErrHelp {
 			return 0
 		}
 		return 2
 	}
 	var data any
-	var err error
 	if flags.NArg() != 0 || (force && !kill) {
 		err = app.ErrInvalid
 	} else {
-		switch command {
-		case "status":
-			data, err = service.Status(ctx)
-		case "stop":
-			data, err = service.Stop(ctx, app.StopOptions{Timeout: stopTimeout})
-		case "restart":
-			escalation := app.StopOnly
-			if term {
-				escalation = app.WithTerm
+		service, loadErr := load(globals.config, globals.server)
+		if loadErr != nil {
+			err = loadErr
+		} else {
+			switch command {
+			case "status":
+				data, err = service.Status(ctx)
+			case "stop":
+				data, err = service.Stop(ctx, app.StopOptions{Timeout: stopTimeout})
+			case "restart":
+				escalation := app.StopOnly
+				if term {
+					escalation = app.WithTerm
+				}
+				if kill {
+					escalation = app.WithKill
+				}
+				data, err = service.Restart(ctx, app.RestartOptions{
+					StartTimeout: startTimeout, NoWait: noWait,
+					StopTimeout: stopTimeout, TermTimeout: termTimeout, KillTimeout: killTimeout,
+					Escalation: escalation, AllowSIGKILL: force,
+				})
 			}
-			if kill {
-				escalation = app.WithKill
-			}
-			data, err = service.Restart(ctx, app.RestartOptions{
-				StartTimeout: startTimeout, NoWait: noWait,
-				StopTimeout: stopTimeout, TermTimeout: termTimeout, KillTimeout: killTimeout,
-				Escalation: escalation, AllowSIGKILL: force,
-			})
 		}
 	}
 	code := app.ExitCode(err)
-	if *asJSON {
+	if *asJSON || globals.json {
 		result := response{Data: data, ExitCode: code}
 		if err != nil {
 			result.Error = err.Error()
@@ -134,4 +156,53 @@ func Run(ctx context.Context, args []string, out, stderr io.Writer, service app.
 		}
 	}
 	return code
+}
+
+// parseGlobals extracts global options wherever they appear, so both
+// "mcwarden -s rail status" and "mcwarden status -s rail" work. A "--"
+// terminates global parsing.
+func parseGlobals(args []string) (globalOptions, []string, error) {
+	var opts globalOptions
+	rest := make([]string, 0, len(args))
+	for i := 0; i < len(args); i++ {
+		arg := args[i]
+		if arg == "--" {
+			rest = append(rest, args[i:]...)
+			break
+		}
+		name, value, hasValue := strings.Cut(arg, "=")
+		switch name {
+		case "-c", "--config":
+			if !hasValue {
+				if i+1 >= len(args) {
+					return opts, nil, fmt.Errorf("--config requires a path: %w", app.ErrInvalid)
+				}
+				i++
+				value = args[i]
+			}
+			opts.config = value
+		case "-s", "--server":
+			if !hasValue {
+				if i+1 >= len(args) {
+					return opts, nil, fmt.Errorf("--server requires a name: %w", app.ErrInvalid)
+				}
+				i++
+				value = args[i]
+			}
+			opts.server = value
+		case "-json", "--json":
+			if hasValue {
+				enabled, err := strconv.ParseBool(value)
+				if err != nil {
+					return opts, nil, fmt.Errorf("invalid --json value %q: %w", value, app.ErrInvalid)
+				}
+				opts.json = enabled
+			} else {
+				opts.json = true
+			}
+		default:
+			rest = append(rest, arg)
+		}
+	}
+	return opts, rest, nil
 }
