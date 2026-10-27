@@ -5,10 +5,12 @@
 package linux
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"strconv"
 	"strings"
+	"syscall"
 )
 
 // Process is a point-in-time snapshot of /proc/<pid>/stat.
@@ -20,9 +22,17 @@ type Process struct {
 	StartTime uint64 // clock ticks since boot (stat field 22)
 }
 
-// Read returns the snapshot for pid. The returned error satisfies
-// errors.Is(err, os.ErrNotExist) when the process no longer exists, which lets
-// callers distinguish a gone process from an unexpected failure.
+// IsGone reports whether err means the process is no longer there. procfs
+// usually returns ENOENT, but during exit and reaping a read can also fail with
+// ESRCH ("no such process"); both mean the PID no longer names a live process.
+// Any other error must not be treated as gone.
+func IsGone(err error) bool {
+	return errors.Is(err, os.ErrNotExist) || errors.Is(err, syscall.ESRCH)
+}
+
+// Read returns the snapshot for pid. The returned error satisfies IsGone when
+// the process no longer exists, which lets callers distinguish a gone process
+// from an unexpected failure.
 func Read(pid int) (Process, error) {
 	if pid <= 0 {
 		return Process{}, fmt.Errorf("invalid pid %d", pid)
@@ -65,4 +75,19 @@ func parseStat(data []byte) (Process, error) {
 		return Process{}, fmt.Errorf("stat starttime: %w", err)
 	}
 	return process, nil
+}
+
+// BootID returns the kernel boot identifier. A process identity stored in one
+// boot is meaningless after a reboot even if the PID and start time happen to
+// match, so persisted state records this value alongside them.
+func BootID() (string, error) {
+	data, err := os.ReadFile("/proc/sys/kernel/random/boot_id")
+	if err != nil {
+		return "", err
+	}
+	id := strings.TrimSpace(string(data))
+	if id == "" {
+		return "", fmt.Errorf("empty boot id")
+	}
+	return id, nil
 }

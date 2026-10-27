@@ -22,7 +22,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"os"
 	"os/exec"
 	"sync"
 	"syscall"
@@ -49,6 +48,10 @@ var (
 	ErrUnsupported = errors.New("unsupported operation")
 	// ErrInvalid is returned for an unusable configuration.
 	ErrInvalid = errors.New("invalid configuration")
+	// ErrIdentityChanged is returned when procfs no longer matches the PID,
+	// start time, or process group recorded for a generation, for example
+	// because the PID was reused or the process moved to another group.
+	ErrIdentityChanged = errors.New("process identity changed")
 )
 
 // Adopt targets a process this Runtime did not start.
@@ -59,6 +62,17 @@ type Adopt struct {
 	// for the original process. Callers that only know a PID should read its
 	// start time and construct Adopt from that PID and start time together.
 	StartTime uint64
+	// PGID is the process group recorded with the identity. When nonzero, a
+	// process found in a different group is rejected as a changed identity. It
+	// may be zero when only a PID and start time are known, in which case the
+	// group is read from procfs on adoption.
+	PGID int
+	// Owned marks a process that a previous MCWarden invocation started and
+	// persisted, as opposed to one discovered through outside means such as a
+	// pidfile. It makes signals target the process group and preserves the
+	// persisted ownership bit. It does not make the process a child of this
+	// invocation, so Wait still cannot observe its exit status.
+	Owned bool
 	// SignalGroup allows signals to reach the adopted process group. It stays
 	// off by default because the group may contain processes outside
 	// MCWarden's control and should only be enabled after confirmation.
@@ -95,6 +109,7 @@ type Runtime struct {
 }
 
 var _ runtime.Runtime = (*Runtime)(nil)
+var _ runtime.Identifiable = (*Runtime)(nil)
 
 // New returns a Runtime for cfg. It does not launch anything; Start or a first
 // observation does.
@@ -107,20 +122,26 @@ type process struct {
 	pid       int
 	pgid      int
 	startTime uint64
-	owned     bool // started by this Runtime
-	group     bool // signals may target the process group
+	// owned is true for a process managed by MCWarden, including one adopted
+	// from persisted state that a previous invocation started. It selects group
+	// signalling and the ownership bit in the identity.
+	owned bool
+	group bool // signals may target the process group
 
-	cmd     *exec.Cmd     // owned only
-	done    chan struct{} // owned: closed once reaped
+	// cmd and done are set only when this Runtime started the process. A
+	// rehydrated owned process is managed but not a child, so it cannot be
+	// wait(2)ed and its exit status is unknown.
+	cmd     *exec.Cmd
+	done    chan struct{}
 	exit    runtime.ExitStatus
 	waitErr error
 }
 
-// gone reports whether the managed process is no longer running. For an owned
-// process this is the reaped state. For an adopted one it reads procfs and may
-// return an error; callers must not treat an unreadable process as gone.
+// gone reports whether the managed process is no longer running. A waitable
+// child uses its reaped state. Anything else reads procfs and may return an
+// error; callers must not treat an unreadable process as gone.
 func (p *process) gone() (bool, error) {
-	if p.owned {
+	if p.done != nil {
 		select {
 		case <-p.done:
 			return true, nil
@@ -128,21 +149,22 @@ func (p *process) gone() (bool, error) {
 			return false, nil
 		}
 	}
-	alive, err := p.adoptedAlive()
+	alive, err := p.procAlive()
 	if err != nil {
 		return false, err
 	}
 	return !alive, nil
 }
 
-// adoptedAlive reports whether the adopted process still exists and still
-// matches the recorded start time. Only a missing process (ENOENT), a start
-// time mismatch, or a zombie/dead state counts as not alive; any other procfs
-// error is returned so the caller never mistakes an unreadable process for a
-// stopped one.
-func (p *process) adoptedAlive() (bool, error) {
+// procAlive reports whether the recorded process generation still exists,
+// matches the recorded start time and process group, and is not a zombie. Only
+// a missing process (ENOENT/ESRCH), a start-time mismatch, or a zombie/dead
+// state counts as not alive; any other procfs error is returned so the caller
+// never mistakes an unreadable process for a stopped one. A process that moved
+// groups is an identity change, not a stopped process.
+func (p *process) procAlive() (bool, error) {
 	stat, err := procRead(p.pid)
-	if errors.Is(err, os.ErrNotExist) {
+	if hostlinux.IsGone(err) {
 		return false, nil
 	}
 	if err != nil {
@@ -154,6 +176,9 @@ func (p *process) adoptedAlive() (bool, error) {
 	switch stat.State {
 	case 'Z', 'X':
 		return false, nil
+	}
+	if p.pgid != 0 && stat.PGID != p.pgid {
+		return false, fmt.Errorf("process %d moved to process group %d: %w", p.pid, stat.PGID, ErrIdentityChanged)
 	}
 	return true, nil
 }
@@ -173,7 +198,7 @@ func (r *Runtime) resolve() (*process, error) {
 		return nil, fmt.Errorf("adopt requires a start time: %w", ErrInvalid)
 	}
 	stat, err := procRead(r.cfg.Adopt.PID)
-	if errors.Is(err, os.ErrNotExist) {
+	if hostlinux.IsGone(err) {
 		return nil, nil
 	}
 	if err != nil {
@@ -183,13 +208,61 @@ func (r *Runtime) resolve() (*process, error) {
 		// A different process now holds the PID; never target it.
 		return nil, nil
 	}
+	if r.cfg.Adopt.PGID != 0 && stat.PGID != r.cfg.Adopt.PGID {
+		return nil, fmt.Errorf("pid %d is in process group %d, recorded %d: %w",
+			stat.PID, stat.PGID, r.cfg.Adopt.PGID, ErrIdentityChanged)
+	}
 	r.proc = &process{
 		pid:       stat.PID,
 		pgid:      stat.PGID,
 		startTime: stat.StartTime,
-		group:     r.cfg.Adopt.SignalGroup,
+		owned:     r.cfg.Adopt.Owned,
+		group:     r.cfg.Adopt.Owned || r.cfg.Adopt.SignalGroup,
 	}
 	return r.proc, nil
+}
+
+// Identity reports the generation this Runtime is already tracking. It returns
+// false when there is no tracked generation or its start time could not be
+// observed. Reporting an identity never launches or adopts a process; call
+// State, Start, Signal, or Wait first to establish the generation.
+func (r *Runtime) Identity() (runtime.Identity, bool) {
+	r.mu.Lock()
+	p := r.proc
+	r.mu.Unlock()
+	if p == nil {
+		return runtime.Identity{}, false
+	}
+	if p.done != nil {
+		select {
+		case <-p.done:
+			return runtime.Identity{}, false
+		default:
+		}
+	} else {
+		alive, err := p.procAlive()
+		if err != nil || !alive {
+			return runtime.Identity{}, false
+		}
+	}
+	if p.startTime == 0 {
+		stat, err := procRead(p.pid)
+		if err != nil {
+			return runtime.Identity{}, false
+		}
+		p.startTime = stat.StartTime
+		p.pgid = stat.PGID
+	}
+	if p.startTime == 0 {
+		return runtime.Identity{}, false
+	}
+	return runtime.Identity{
+		PID:         p.pid,
+		PGID:        p.pgid,
+		StartTime:   p.startTime,
+		Owned:       p.owned,
+		SignalGroup: p.group,
+	}, true
 }
 
 // Start launches the configured command in a new process group. Success means
@@ -292,7 +365,9 @@ func (r *Runtime) State(ctx context.Context) (runtime.State, error) {
 
 // Signal delivers a signal to the current generation. Owned processes are
 // signalled through their process group; adopted ones only reach the group when
-// explicitly allowed.
+// explicitly allowed. Immediately before signalling, the PID, start time, and
+// process group are re-read from procfs so a reused PID or a moved process is
+// never targeted.
 func (r *Runtime) Signal(ctx context.Context, sig runtime.Signal) error {
 	if err := ctx.Err(); err != nil {
 		return err
@@ -308,12 +383,8 @@ func (r *Runtime) Signal(ctx context.Context, sig runtime.Signal) error {
 	if p == nil {
 		return ErrNotStarted
 	}
-	gone, err := p.gone()
-	if err != nil {
+	if err := r.verifySignal(p); err != nil {
 		return err
-	}
-	if gone {
-		return ErrNotStarted
 	}
 	target := p.pid
 	if p.owned || p.group {
@@ -321,6 +392,48 @@ func (r *Runtime) Signal(ctx context.Context, sig runtime.Signal) error {
 	}
 	if err := syscall.Kill(target, native); err != nil {
 		return fmt.Errorf("signal %s: %w", sig, err)
+	}
+	return nil
+}
+
+// verifySignal re-reads procfs right before a signal. Group signalling also
+// requires the process to still lead that group, so an adopted PID that merely
+// belongs to someone else's group is never used as a group handle. Callers
+// serialize lifecycle operations, so updating an unidentified start time here
+// does not race with another Signal.
+func (r *Runtime) verifySignal(p *process) error {
+	if p.done != nil {
+		select {
+		case <-p.done:
+			return ErrNotStarted
+		default:
+		}
+	}
+	stat, err := procRead(p.pid)
+	if hostlinux.IsGone(err) {
+		return ErrNotStarted
+	}
+	if err != nil {
+		return fmt.Errorf("verify process %d: %w", p.pid, err)
+	}
+	switch stat.State {
+	case 'Z', 'X':
+		return ErrNotStarted
+	}
+	if p.startTime == 0 {
+		p.startTime = stat.StartTime
+	} else if stat.StartTime != p.startTime {
+		return fmt.Errorf("pid %d now belongs to a different process: %w", p.pid, ErrIdentityChanged)
+	}
+	if p.pgid == 0 {
+		p.pgid = stat.PGID
+	} else if stat.PGID != p.pgid {
+		return fmt.Errorf("process %d moved to process group %d: %w", p.pid, stat.PGID, ErrIdentityChanged)
+	}
+	if p.owned || p.group {
+		if p.pgid != p.pid {
+			return fmt.Errorf("process %d is not a process group leader (pgid %d): %w", p.pid, p.pgid, ErrIdentityChanged)
+		}
 	}
 	return nil
 }
@@ -336,7 +449,7 @@ func (r *Runtime) Wait(ctx context.Context) (runtime.ExitStatus, error) {
 	if p == nil {
 		return runtime.ExitStatus{}, ErrNotStarted
 	}
-	if p.owned {
+	if p.done != nil {
 		select {
 		case <-p.done:
 			return p.exit, p.waitErr
@@ -351,12 +464,13 @@ func (r *Runtime) Wait(ctx context.Context) (runtime.ExitStatus, error) {
 		if err := ctx.Err(); err != nil {
 			return runtime.ExitStatus{}, err
 		}
-		alive, err := p.adoptedAlive()
+		alive, err := p.procAlive()
 		if err != nil {
 			return runtime.ExitStatus{}, err
 		}
 		if !alive {
-			// An adopted process is not a child, so no exit status is available.
+			// A rehydrated or adopted process is not a child of this
+			// invocation, so no exit status is available.
 			return runtime.ExitStatus{Known: false}, nil
 		}
 		select {

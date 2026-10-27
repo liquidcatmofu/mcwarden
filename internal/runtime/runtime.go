@@ -51,3 +51,22 @@ type Runtime interface {
 	Signal(context.Context, Signal) error
 	Wait(context.Context) (ExitStatus, error)
 }
+
+// Identity describes the process generation a runtime is currently tracking.
+// StartTime comes from procfs and guards against PID reuse. Owned is true when
+// this Runtime started the process rather than adopting an existing one.
+type Identity struct {
+	PID         int    `json:"pid"`
+	PGID        int    `json:"pgid"`
+	StartTime   uint64 `json:"start_time"`
+	Owned       bool   `json:"owned"`
+	SignalGroup bool   `json:"signal_group,omitempty"`
+}
+
+// Identifiable is implemented by runtimes that can report the identity of the
+// generation they track. It is optional so runtimes without host processes are
+// not forced to expose one. Identity must not adopt or start a process as a
+// side effect.
+type Identifiable interface {
+	Identity() (Identity, bool)
+}
