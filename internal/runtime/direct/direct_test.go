@@ -235,6 +235,87 @@ func TestOwnedProcessGroupSignal(t *testing.T) {
 	waitGone(t, grandchild, 5*time.Second)
 }
 
+// TestAdoptRejectsChangedPGID verifies that a recorded process group is checked
+// on adoption, so a moved process is neither reported as stopped nor signalled.
+func TestAdoptRejectsChangedPGID(t *testing.T) {
+	pid, stop := startExternal(t, "sleep", "")
+	defer stop()
+	stat := readStat(t, pid)
+	rt := direct.New(direct.Config{Adopt: &direct.Adopt{
+		PID: stat.PID, PGID: stat.PGID + 1, StartTime: stat.StartTime, Owned: true,
+	}})
+	if _, err := rt.State(context.Background()); !errors.Is(err, direct.ErrIdentityChanged) {
+		t.Fatalf("err=%v", err)
+	}
+	if err := rt.Signal(context.Background(), runtime.Kill); !errors.Is(err, direct.ErrIdentityChanged) {
+		t.Fatalf("signal err=%v", err)
+	}
+	if _, err := hostlinux.Read(pid); err != nil {
+		t.Fatalf("process was signalled: %v", err)
+	}
+}
+
+// TestAdoptOwnedGeneration verifies that persisted MCWarden ownership is
+// restored without pretending the process is a waitable child of this process.
+func TestAdoptOwnedGeneration(t *testing.T) {
+	ctx := context.Background()
+	pid, stop := startExternal(t, "sleep", "")
+	defer stop()
+	stat := readStat(t, pid)
+	rt := direct.New(direct.Config{Adopt: &direct.Adopt{
+		PID: stat.PID, PGID: stat.PGID, StartTime: stat.StartTime, Owned: true,
+	}})
+
+	id, ok := rt.Identity()
+	if !ok {
+		t.Fatal("no identity")
+	}
+	if !id.Owned || !id.SignalGroup || id.PID != stat.PID || id.PGID != stat.PGID || id.StartTime != stat.StartTime {
+		t.Fatalf("identity=%+v stat=%+v", id, stat)
+	}
+	if state, err := rt.State(ctx); err != nil || state != runtime.Running {
+		t.Fatalf("state=%s err=%v", state, err)
+	}
+	if err := rt.Start(ctx); !errors.Is(err, direct.ErrAlreadyRunning) {
+		t.Fatalf("start while rehydrated err=%v", err)
+	}
+	if err := rt.Signal(ctx, runtime.Kill); err != nil {
+		t.Fatalf("signal: %v", err)
+	}
+	exit, err := rt.Wait(ctx)
+	if err != nil {
+		t.Fatalf("wait: %v", err)
+	}
+	if exit.Known {
+		t.Fatalf("rehydrated owned exit should be unknown: %+v", exit)
+	}
+	if state, err := rt.State(ctx); err != nil || state != runtime.Stopped {
+		t.Fatalf("state=%s err=%v", state, err)
+	}
+}
+
+// TestAdoptOwnedRequiresLeader verifies that restoring ownership never turns a
+// process that merely belongs to a group into a group-signalling target.
+func TestAdoptOwnedRequiresLeader(t *testing.T) {
+	pid, stop := startExternalUngrouped(t, "sleep", "")
+	defer stop()
+	stat := readStat(t, pid)
+	if stat.PGID == stat.PID {
+		t.Skip("helper unexpectedly leads its own group")
+	}
+	rt := direct.New(direct.Config{Adopt: &direct.Adopt{
+		PID: stat.PID, PGID: stat.PGID, StartTime: stat.StartTime, Owned: true,
+	}})
+	if err := rt.Signal(context.Background(), runtime.Kill); !errors.Is(err, direct.ErrIdentityChanged) {
+		t.Fatalf("err=%v", err)
+	}
+	if _, err := hostlinux.Read(pid); err != nil {
+		t.Fatalf("process was signalled: %v", err)
+	}
+}
+
+// TestAdoptExistingProcess verifies that a plain adopted process stays
+// unowned and waits through procfs.
 func TestAdoptExistingProcess(t *testing.T) {
 	ctx := context.Background()
 	pid, stop := startExternal(t, "sleep", "")

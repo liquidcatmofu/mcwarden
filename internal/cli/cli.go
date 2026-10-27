@@ -17,9 +17,10 @@ import (
 
 const usage = `Usage: mcwarden [global options] <command> [options]
 
-Commands: status, stop, restart, state, version, help
+Commands: status, start, stop, restart, state, version, help
 Global options: -c, --config <path>  -s, --server <name>  --json
 State: state show | state clean
+Start: --start-timeout=120s [--no-wait]
 Stop: --stop-timeout=120s
 Restart: --stop-timeout=120s --term [--term-timeout=30s]
          --kill --force [--kill-timeout=10s]
@@ -71,7 +72,7 @@ func Run(ctx context.Context, args []string, out, stderr io.Writer, load Loader)
 	if command == "state" {
 		return runState(ctx, rest[1:], globals, out, stderr, load)
 	}
-	if command != "status" && command != "stop" && command != "restart" {
+	if command != "status" && command != "start" && command != "stop" && command != "restart" {
 		fmt.Fprintf(stderr, "unknown command: %s\n", command)
 		return 2
 	}
@@ -80,10 +81,14 @@ func Run(ctx context.Context, args []string, out, stderr io.Writer, load Loader)
 	asJSON := flags.Bool("json", false, "emit JSON")
 	var stopTimeout, termTimeout, killTimeout, startTimeout time.Duration
 	var term, kill, force, noWait bool
-	if command != "status" {
+	switch command {
+	case "start":
+		flags.BoolVar(&noWait, "no-wait", false, "return after process launch without waiting for Minecraft startup")
+		flags.DurationVar(&startTimeout, "start-timeout", 120*time.Second, "Minecraft startup wait timeout")
+	case "stop":
 		flags.DurationVar(&stopTimeout, "stop-timeout", 120*time.Second, "graceful stop timeout")
-	}
-	if command == "restart" {
+	case "restart":
+		flags.DurationVar(&stopTimeout, "stop-timeout", 120*time.Second, "graceful stop timeout")
 		flags.BoolVar(&noWait, "no-wait", false, "return after process launch without waiting for Minecraft startup")
 		flags.DurationVar(&startTimeout, "start-timeout", 120*time.Second, "Minecraft startup wait timeout")
 		flags.BoolVar(&term, "term", false, "send SIGTERM after graceful timeout")
@@ -109,6 +114,8 @@ func Run(ctx context.Context, args []string, out, stderr io.Writer, load Loader)
 			switch command {
 			case "status":
 				data, err = service.Status(ctx)
+			case "start":
+				data, err = service.Start(ctx, app.StartOptions{StartTimeout: startTimeout, NoWait: noWait})
 			case "stop":
 				data, err = service.Stop(ctx, app.StopOptions{Timeout: stopTimeout})
 			case "restart":

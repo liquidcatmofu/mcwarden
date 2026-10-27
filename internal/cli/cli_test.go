@@ -26,6 +26,9 @@ func TestRun(t *testing.T) {
 		{[]string{"version"}, 0, false},
 		{[]string{"unknown"}, 2, false},
 		{[]string{"status", "--json"}, 5, true},
+		{[]string{"start", "--json"}, 5, true},
+		{[]string{"start", "--no-wait", "--json"}, 5, true},
+		{[]string{"start", "--start-timeout=0s", "--json"}, 2, true},
 		{[]string{"stop", "--json"}, 5, true},
 		{[]string{"restart", "--kill", "--json"}, 2, true},
 		{[]string{"restart", "--force", "--json"}, 2, true},
@@ -130,7 +133,12 @@ func TestStateCommands(t *testing.T) {
 	if err := os.Chmod(dir, 0o700); err != nil {
 		t.Fatal(err)
 	}
+	stateDir := t.TempDir()
+	if err := os.Chmod(stateDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
 	t.Setenv("XDG_RUNTIME_DIR", dir)
+	t.Setenv("XDG_STATE_HOME", stateDir)
 	service := app.Service{StateStore: func() (*state.Store, error) { return state.Open("rail") }}
 
 	for _, args := range [][]string{

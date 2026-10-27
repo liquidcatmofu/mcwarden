@@ -25,27 +25,40 @@ var (
 	bootID   = hostlinux.BootID
 )
 
-// Store manages the state document for one server.
+// Store manages the state document for one server. Identity JSON lives in a
+// persistent state directory, while the advisory lock lives in the runtime
+// directory: the identity must outlive a login session, but a lock is only
+// meaningful while the user is active.
 type Store struct {
 	dir    string
 	server string
 }
 
-// Open prepares the runtime state directory for server. It accepts
-// $XDG_RUNTIME_DIR when it is safe and otherwise falls back to /run/user/<uid>
-// only if that directory exists, is owned by the current user, and is not
-// accessible to group or others. A missing or unsafe directory is an error:
-// state is never written to /tmp or another improvised location.
+// Open returns a store for server. It does not create directories or read the
+// state file, so a read-only command can inspect missing state without needing
+// a writable runtime directory. Save and Lock create their directories.
 func Open(server string) (*Store, error) {
-	base, err := runtimeBase()
+	base, err := stateBase()
 	if err != nil {
 		return nil, err
 	}
-	dir := filepath.Join(base, "mcwarden")
-	if err := ensureDir(dir); err != nil {
-		return nil, err
+	return &Store{dir: filepath.Join(base, "mcwarden"), server: server}, nil
+}
+
+// stateBase follows the XDG base directory specification for persistent data.
+// Unlike the runtime directory, it has no fallback beyond the user's home.
+func stateBase() (string, error) {
+	if dir := os.Getenv("XDG_STATE_HOME"); dir != "" {
+		if !filepath.IsAbs(dir) {
+			return "", fmt.Errorf("%w: XDG_STATE_HOME %q is not absolute", ErrUnavailable, dir)
+		}
+		return dir, nil
 	}
-	return &Store{dir: dir, server: server}, nil
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", fmt.Errorf("%w: cannot determine home directory: %v", ErrUnavailable, err)
+	}
+	return filepath.Join(home, ".local", "state"), nil
 }
 
 func runtimeBase() (string, error) {
@@ -106,7 +119,20 @@ func ensureDir(dir string) error {
 // Path returns the state file path for this server.
 func (s *Store) Path() string { return filepath.Join(s.dir, s.key()+".json") }
 
-func (s *Store) lockPath() string { return filepath.Join(s.dir, s.key()+".lock") }
+// lockPath prepares the runtime directory and returns the server lock path.
+// Only mutating operations take a lock, so read-only state inspection works
+// even when no runtime directory is available.
+func (s *Store) lockPath() (string, error) {
+	base, err := runtimeBase()
+	if err != nil {
+		return "", err
+	}
+	dir := filepath.Join(base, "mcwarden")
+	if err := ensureDir(dir); err != nil {
+		return "", err
+	}
+	return filepath.Join(dir, s.key()+".lock"), nil
+}
 
 // key derives a filename from the server name. Simple names are used as-is;
 // anything else is hashed so a name can never escape the state directory.
@@ -246,6 +272,9 @@ func (s *Store) Save(runtimeName string, id Identity) error {
 	}
 	data = append(data, '\n')
 
+	if err := ensureDir(s.dir); err != nil {
+		return err
+	}
 	tmp, err := os.CreateTemp(s.dir, "."+s.key()+".*.tmp")
 	if err != nil {
 		return fmt.Errorf("create state temp file: %w", err)
@@ -279,7 +308,10 @@ func (s *Store) Save(runtimeName string, id Identity) error {
 // Clean removes the state document. The caller decides whether removal is
 // allowed; Clean itself only performs the removal.
 func (s *Store) Clean() error {
-	if err := os.Remove(s.Path()); err != nil && !errors.Is(err, os.ErrNotExist) {
+	if err := os.Remove(s.Path()); err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
 		return fmt.Errorf("remove state %s: %w", s.Path(), err)
 	}
 	if err := syncDir(s.dir); err != nil {
@@ -297,10 +329,15 @@ func syncDir(dir string) error {
 	return f.Sync()
 }
 
-// Lock takes a non-blocking exclusive lock for the server. It serializes state
-// validation, process start, and state save across CLI invocations.
+// Lock takes a non-blocking exclusive lock for the server. It serializes all
+// mutating lifecycle operations across CLI invocations. The lock file lives in
+// the runtime directory, not next to the persistent identity document.
 func (s *Store) Lock() (*Lock, error) {
-	f, err := os.OpenFile(s.lockPath(), os.O_CREATE|os.O_RDWR, 0o600)
+	path, err := s.lockPath()
+	if err != nil {
+		return nil, err
+	}
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o600)
 	if err != nil {
 		return nil, fmt.Errorf("open state lock: %w", err)
 	}

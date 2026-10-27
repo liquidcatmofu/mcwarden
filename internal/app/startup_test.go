@@ -15,7 +15,11 @@ type startupRuntime struct {
 	fake
 	launched bool
 	states   []runtime.State
+	identity runtime.Identity
+	hasID    bool
 }
+
+func (f *startupRuntime) Identity() (runtime.Identity, bool) { return f.identity, f.hasID }
 
 func (f *startupRuntime) Start(ctx context.Context) error {
 	err := f.fake.Start(ctx)
@@ -179,4 +183,26 @@ func TestStopRecordsStateAndEvents(t *testing.T) {
 	if !errors.Is(err, ErrTimeout) || result.State != minecraft.Stopping || !reflect.DeepEqual(result.Events, []Event{StopRequested, StopTimedOut}) {
 		t.Fatalf("result=%+v err=%v", result, err)
 	}
+}
+
+// TestStartupExitCleansState verifies that a process which exits during startup
+// does not leave stale identity behind to block the next start.
+func TestStartupExitCleansState(t *testing.T) {
+	rt := &startupRuntime{
+		fake:     fake{state: runtime.Stopped},
+		states:   []runtime.State{runtime.Stopped},
+		hasID:    true,
+		identity: runtime.Identity{PID: 1 << 30, PGID: 1 << 30, StartTime: 1, Owned: true},
+	}
+	service := stateService(t, rt, "rail")
+	service.Minecraft = &startupControl{runtime: rt}
+
+	if _, err := service.Start(context.Background(), StartOptions{StartTimeout: time.Second}); !errors.Is(err, ErrStartupFailed) {
+		t.Fatalf("err=%v", err)
+	}
+	store, err := service.StateStore()
+	if err != nil {
+		t.Fatal(err)
+	}
+	requireAbsent(t, store)
 }

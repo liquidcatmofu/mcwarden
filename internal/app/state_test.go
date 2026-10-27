@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"testing"
+	"time"
 
 	hostlinux "github.com/liquidcatmofu/mcwarden/internal/host/linux"
 	"github.com/liquidcatmofu/mcwarden/internal/runtime"
@@ -42,6 +43,7 @@ func (f *stateRuntime) Signal(context.Context, runtime.Signal) error {
 }
 
 func (f *stateRuntime) Wait(context.Context) (runtime.ExitStatus, error) {
+	f.state = runtime.Stopped
 	return runtime.ExitStatus{Known: true}, nil
 }
 
@@ -51,11 +53,16 @@ func (f *stateRuntime) Identity() (runtime.Identity, bool) {
 
 func stateService(t *testing.T, rt runtime.Runtime, server string) Service {
 	t.Helper()
-	dir := t.TempDir()
-	if err := os.Chmod(dir, 0o700); err != nil {
+	stateDir := t.TempDir()
+	runtimeDir := t.TempDir()
+	if err := os.Chmod(stateDir, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	t.Setenv("XDG_RUNTIME_DIR", dir)
+	if err := os.Chmod(runtimeDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("XDG_STATE_HOME", stateDir)
+	t.Setenv("XDG_RUNTIME_DIR", runtimeDir)
 	return Service{
 		Runtime:     rt,
 		RuntimeName: "direct",
@@ -76,7 +83,7 @@ func TestStartPersistsIdentity(t *testing.T) {
 		},
 	}
 	service := stateService(t, rt, "rail")
-	result, err := service.Start(context.Background())
+	result, err := service.Start(context.Background(), StartOptions{NoWait: true})
 	if err != nil {
 		t.Fatalf("start: %v", err)
 	}
@@ -116,7 +123,7 @@ func TestStartRefusesManagedState(t *testing.T) {
 	if err := store.Save("direct", real); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := service.Start(context.Background()); !errors.Is(err, ErrAlreadyRunning) {
+	if _, err := service.Start(context.Background(), StartOptions{NoWait: true}); !errors.Is(err, ErrAlreadyRunning) {
 		t.Fatalf("err=%v", err)
 	}
 	if rt.started != 0 {
@@ -134,7 +141,7 @@ func TestStartRefusesStaleState(t *testing.T) {
 	if err := store.Save("direct", state.Identity{PID: 1 << 30, PGID: 1 << 30, StartTime: 1}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := service.Start(context.Background()); !errors.Is(err, ErrStaleState) {
+	if _, err := service.Start(context.Background(), StartOptions{NoWait: true}); !errors.Is(err, ErrStaleState) {
 		t.Fatalf("err=%v", err)
 	}
 	if rt.started != 0 {
@@ -145,7 +152,7 @@ func TestStartRefusesStaleState(t *testing.T) {
 func TestStartRefusesRunningRuntimeWithoutState(t *testing.T) {
 	rt := &stateRuntime{state: runtime.Running, hasID: true, identity: runtime.Identity{PID: os.Getpid(), PGID: os.Getpid(), StartTime: 1}}
 	service := stateService(t, rt, "rail")
-	if _, err := service.Start(context.Background()); !errors.Is(err, ErrAlreadyRunning) {
+	if _, err := service.Start(context.Background(), StartOptions{NoWait: true}); !errors.Is(err, ErrAlreadyRunning) {
 		t.Fatalf("err=%v", err)
 	}
 	if rt.started != 0 {
@@ -156,7 +163,7 @@ func TestStartRefusesRunningRuntimeWithoutState(t *testing.T) {
 func TestStartRollsBackWithoutIdentity(t *testing.T) {
 	rt := &stateRuntime{state: runtime.Stopped, hasID: false}
 	service := stateService(t, rt, "rail")
-	if _, err := service.Start(context.Background()); !errors.Is(err, ErrStateUnknown) {
+	if _, err := service.Start(context.Background(), StartOptions{NoWait: true}); !errors.Is(err, ErrStateUnknown) {
 		t.Fatalf("err=%v", err)
 	}
 	if rt.started != 1 || rt.signals != 1 {
@@ -233,5 +240,143 @@ func TestStateWithoutStoreIsUnsupported(t *testing.T) {
 	service := Service{}
 	if _, err := service.StateStatus(context.Background()); !errors.Is(err, ErrUnsupported) {
 		t.Fatalf("err=%v", err)
+	}
+}
+
+func saveStaleState(t *testing.T, service Service) *state.Store {
+	t.Helper()
+	store, err := service.StateStore()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Save("direct", state.Identity{PID: 1 << 30, PGID: 1 << 30, StartTime: 1}); err != nil {
+		t.Fatal(err)
+	}
+	return store
+}
+
+func requireAbsent(t *testing.T, store *state.Store) {
+	t.Helper()
+	inspection, err := store.Inspect()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if inspection.Status != state.Absent {
+		t.Fatalf("inspection=%+v", inspection)
+	}
+}
+
+// TestStopCleansExitedState verifies that a confirmed exit removes the old
+// identity during the same operation, so no stale record is left behind.
+func TestStopCleansExitedState(t *testing.T) {
+	rt := &stateRuntime{state: runtime.Running}
+	service := stateService(t, rt, "rail")
+	service.Minecraft = &fake{}
+	store := saveStaleState(t, service)
+
+	if _, err := service.Stop(context.Background(), StopOptions{Timeout: time.Second}); err != nil {
+		t.Fatalf("stop: %v", err)
+	}
+	requireAbsent(t, store)
+}
+
+// TestRestartCleansOldStateBeforeStart covers the restart path that previously
+// failed: the old generation exits, its state is cleaned, and the new
+// generation is started and recorded under the same lock.
+func TestRestartCleansOldStateBeforeStart(t *testing.T) {
+	current, err := currentIdentity()
+	if err != nil {
+		t.Fatal(err)
+	}
+	rt := &stateRuntime{
+		state: runtime.Running,
+		hasID: true,
+		identity: runtime.Identity{
+			PID: current.PID, PGID: current.PGID, StartTime: current.StartTime, Owned: true,
+		},
+	}
+	service := stateService(t, rt, "rail")
+	service.Minecraft = &fake{}
+	store := saveStaleState(t, service)
+
+	if _, err := service.Restart(context.Background(), RestartOptions{NoWait: true, StopTimeout: time.Second}); err != nil {
+		t.Fatalf("restart: %v", err)
+	}
+	if rt.started != 1 {
+		t.Fatalf("started=%d", rt.started)
+	}
+	inspection, err := store.Inspect()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if inspection.Status != state.Managed || inspection.Record == nil || inspection.Record.PID != current.PID {
+		t.Fatalf("inspection=%+v", inspection)
+	}
+}
+
+// TestStopRefusesToCleanManagedState verifies that a confirmed wait on one
+// generation never deletes state that still describes another live process.
+func TestStopRefusesToCleanManagedState(t *testing.T) {
+	rt := &stateRuntime{state: runtime.Running}
+	service := stateService(t, rt, "rail")
+	service.Minecraft = &fake{}
+	store, err := service.StateStore()
+	if err != nil {
+		t.Fatal(err)
+	}
+	current, err := currentIdentity()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Save("direct", current); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.Stop(context.Background(), StopOptions{Timeout: time.Second}); !errors.Is(err, state.ErrManaged) {
+		t.Fatalf("err=%v", err)
+	}
+	if _, err := os.Stat(store.Path()); err != nil {
+		t.Fatalf("managed state was removed: %v", err)
+	}
+}
+
+// TestMutationsLockServer verifies that every mutating operation takes the
+// per-server lock before touching state or the runtime.
+func TestMutationsLockServer(t *testing.T) {
+	service := stateService(t, &stateRuntime{state: runtime.Stopped}, "rail")
+	store, err := service.StateStore()
+	if err != nil {
+		t.Fatal(err)
+	}
+	lock, err := store.Lock()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lock.Unlock()
+
+	ctx := context.Background()
+	operations := map[string]func() error{
+		"start": func() error {
+			_, err := service.Start(ctx, StartOptions{NoWait: true})
+			return err
+		},
+		"stop": func() error {
+			_, err := service.Stop(ctx, StopOptions{Timeout: time.Second})
+			return err
+		},
+		"restart": func() error {
+			_, err := service.Restart(ctx, RestartOptions{NoWait: true, StopTimeout: time.Second})
+			return err
+		},
+		"clean": func() error {
+			_, err := service.CleanState(ctx)
+			return err
+		},
+	}
+	for name, run := range operations {
+		t.Run(name, func(t *testing.T) {
+			if err := run(); !errors.Is(err, state.ErrBusy) {
+				t.Fatalf("err=%v", err)
+			}
+		})
 	}
 }

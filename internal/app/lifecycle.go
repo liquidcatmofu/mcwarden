@@ -25,6 +25,11 @@ type StopOptions struct {
 	Timeout time.Duration
 }
 
+type StartOptions struct {
+	StartTimeout time.Duration
+	NoWait       bool
+}
+
 type RestartOptions struct {
 	StartTimeout time.Duration
 	NoWait       bool
@@ -90,7 +95,7 @@ func (s Service) requireRunning(ctx context.Context) error {
 	return nil
 }
 
-func (s Service) graceful(ctx context.Context, timeout time.Duration, result *Result) error {
+func (s Service) graceful(ctx context.Context, m *mutation, timeout time.Duration, result *Result) error {
 	if err := s.requireRunning(ctx); err != nil {
 		return err
 	}
@@ -112,10 +117,10 @@ func (s Service) graceful(ctx context.Context, timeout time.Duration, result *Re
 	}
 	result.Events = append(result.Events, StopRequested)
 	result.State = minecraft.Stopping
-	return s.wait(ctx, timeout, result, StopTimedOut)
+	return s.wait(ctx, m, timeout, result, StopTimedOut)
 }
 
-func (s Service) wait(ctx context.Context, timeout time.Duration, result *Result, timedOut Event) error {
+func (s Service) wait(ctx context.Context, m *mutation, timeout time.Duration, result *Result, timedOut Event) error {
 	child, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 	exit, err := s.Runtime.Wait(child)
@@ -133,58 +138,83 @@ func (s Service) wait(ctx context.Context, timeout time.Duration, result *Result
 	result.Events = append(result.Events, Stopped)
 	result.State = minecraft.Stopped
 	result.Exit = &exit
+	// Wait positively observed this generation exit, so its persisted identity
+	// is no longer managed. Remove it now, under the same server lock, before a
+	// restart tries to start the next generation. Only stale state may be
+	// removed; managed or unverifiable state means another generation exists.
+	if err := m.cleanExited(); err != nil {
+		return fmt.Errorf("clean exited generation: %w", err)
+	}
 	return nil
 }
 
 // Start validates persisted state, locks the server, launches the process, and
-// persists the new generation's identity. It returns after process launch; it
-// does not wait for Minecraft readiness.
-func (s Service) Start(ctx context.Context) (Result, error) {
+// persists the new generation's identity. With NoWait it returns after process
+// launch; otherwise it waits for the Minecraft readiness observer.
+func (s Service) Start(ctx context.Context, opts StartOptions) (Result, error) {
 	result := Result{Events: []Event{}, State: minecraft.Unknown}
 	if err := ctx.Err(); err != nil {
 		return result, err
 	}
+	var observer minecraft.Observer
+	if !opts.NoWait {
+		if opts.StartTimeout <= 0 {
+			return result, fmt.Errorf("start timeout must be positive: %w", ErrInvalid)
+		}
+		var ok bool
+		observer, ok = s.Minecraft.(minecraft.Observer)
+		if !ok {
+			return result, ErrUnsupported
+		}
+		caps, err := s.Minecraft.Capabilities(ctx)
+		if err != nil {
+			return result, fmt.Errorf("minecraft capabilities: %w", err)
+		}
+		if !caps.Readiness {
+			return result, ErrUnsupported
+		}
+	}
+	m, err := s.beginMutation()
+	if err != nil {
+		return result, err
+	}
+	defer m.release()
 	result.Events = append(result.Events, StartRequested)
-	if err := s.startProcess(ctx); err != nil {
+	if err := s.startGeneration(ctx, m); err != nil {
 		return result, err
 	}
 	result.Events = append(result.Events, ProcessStarted)
 	result.State = minecraft.Starting
-	return result, nil
+	if opts.NoWait {
+		return result, nil
+	}
+	return result, s.awaitStartup(ctx, m, opts.StartTimeout, observer, &result)
 }
 
-// startProcess is shared by Start and Restart. When state is configured it
-// holds the server lock across validation, launch, and save:
+// startGeneration is shared by Start and Restart and must be called with the
+// server mutation lock held. When state is configured:
 //
 //   - managed state means the process is still the recorded generation;
-//   - stale state must be cleaned explicitly;
+//   - stale state must be cleaned explicitly by an operation that observed the
+//     exit, or with "mcwarden state clean";
 //   - unknown state is never treated as stopped;
 //   - absent state still checks the runtime, which covers pidfile adoption.
 //
 // If the identity cannot be saved after launch, the new process is stopped
 // again rather than left untracked, because an untracked process would allow a
 // later invocation to start a second one.
-func (s Service) startProcess(ctx context.Context) error {
+func (s Service) startGeneration(ctx context.Context, m *mutation) error {
 	if s.Runtime == nil {
 		return ErrUnsupported
 	}
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	if s.StateStore == nil {
+	if m.store == nil {
 		return s.Runtime.Start(ctx)
 	}
-	store, err := s.StateStore()
-	if err != nil {
-		return fmt.Errorf("state: %w", err)
-	}
-	lock, err := store.Lock()
-	if err != nil {
-		return fmt.Errorf("state lock: %w", err)
-	}
-	defer lock.Unlock()
 
-	inspection, err := store.Inspect()
+	inspection, err := m.store.Inspect()
 	if err != nil {
 		return fmt.Errorf("state: %w", err)
 	}
@@ -214,15 +244,15 @@ func (s Service) startProcess(ctx context.Context) error {
 
 	identity, ok := s.identity()
 	if !ok {
-		rollbackErr := s.rollbackStart(ctx)
+		rollbackErr := errors.Join(s.rollbackStart(ctx), m.cleanExited())
 		return fmt.Errorf("%w: runtime did not report process identity (rollback: %v)", ErrStateUnknown, rollbackErr)
 	}
 	runtimeName := s.RuntimeName
 	if runtimeName == "" {
 		runtimeName = "direct"
 	}
-	if err := store.Save(runtimeName, identity); err != nil {
-		rollbackErr := s.rollbackStart(ctx)
+	if err := m.store.Save(runtimeName, identity); err != nil {
+		rollbackErr := errors.Join(s.rollbackStart(ctx), m.cleanExited())
 		return fmt.Errorf("save process state: %w (rollback: %v)", err, rollbackErr)
 	}
 	return nil
@@ -266,12 +296,18 @@ func (s Service) Stop(ctx context.Context, opts StopOptions) (Result, error) {
 	if opts.Timeout <= 0 {
 		return result, fmt.Errorf("stop timeout must be positive: %w", ErrInvalid)
 	}
-	err := s.graceful(ctx, opts.Timeout, &result)
+	m, err := s.beginMutation()
+	if err != nil {
+		return result, err
+	}
+	defer m.release()
+	err = s.graceful(ctx, m, opts.Timeout, &result)
 	return result, err
 }
 
 // Restart escalates only after its own wait timeout, never after an arbitrary
-// error. Start is called only after Wait positively confirms the old process exited.
+// error. Start is called only after Wait positively confirms the old process
+// exited. One server lock covers stop, escalation, state cleanup, and start.
 func (s Service) Restart(ctx context.Context, opts RestartOptions) (Result, error) {
 	result := Result{Events: []Event{}, State: minecraft.Unknown}
 	if (!opts.NoWait && opts.StartTimeout <= 0) || opts.StopTimeout <= 0 || opts.Escalation < StopOnly || opts.Escalation > WithKill ||
@@ -299,12 +335,17 @@ func (s Service) Restart(ctx context.Context, opts RestartOptions) (Result, erro
 			return result, ErrUnsupported
 		}
 	}
-	err := s.graceful(ctx, opts.StopTimeout, &result)
+	m, err := s.beginMutation()
+	if err != nil {
+		return result, err
+	}
+	defer m.release()
+	err = s.graceful(ctx, m, opts.StopTimeout, &result)
 	if errors.Is(err, errWaitTimeout) && ctx.Err() == nil && opts.Escalation >= WithTerm {
-		err = s.signalAndWait(ctx, runtime.Terminate, TermSent, TermTimedOut, opts.TermTimeout, &result)
+		err = s.signalAndWait(ctx, m, runtime.Terminate, TermSent, TermTimedOut, opts.TermTimeout, &result)
 	}
 	if errors.Is(err, errWaitTimeout) && ctx.Err() == nil && opts.Escalation == WithKill {
-		err = s.signalAndWait(ctx, runtime.Kill, KillSent, KillTimedOut, opts.KillTimeout, &result)
+		err = s.signalAndWait(ctx, m, runtime.Kill, KillSent, KillTimedOut, opts.KillTimeout, &result)
 	}
 	if err != nil {
 		return result, err
@@ -313,7 +354,7 @@ func (s Service) Restart(ctx context.Context, opts RestartOptions) (Result, erro
 		return result, err
 	}
 	result.Events = append(result.Events, StartRequested)
-	if err := s.startProcess(ctx); err != nil {
+	if err := s.startGeneration(ctx, m); err != nil {
 		return result, err
 	}
 	result.Events = append(result.Events, ProcessStarted)
@@ -322,7 +363,7 @@ func (s Service) Restart(ctx context.Context, opts RestartOptions) (Result, erro
 	if opts.NoWait {
 		return result, nil
 	}
-	err = s.awaitStartup(ctx, opts.StartTimeout, observer, &result)
+	err = s.awaitStartup(ctx, m, opts.StartTimeout, observer, &result)
 	return result, err
 }
 
@@ -339,7 +380,7 @@ func describeExit(exit runtime.ExitStatus) string {
 	}
 }
 
-func (s Service) signalAndWait(ctx context.Context, signal runtime.Signal, sent, timedOut Event, timeout time.Duration, result *Result) error {
+func (s Service) signalAndWait(ctx context.Context, m *mutation, signal runtime.Signal, sent, timedOut Event, timeout time.Duration, result *Result) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -347,12 +388,14 @@ func (s Service) signalAndWait(ctx context.Context, signal runtime.Signal, sent,
 		return fmt.Errorf("send %s: %w", signal, err)
 	}
 	result.Events = append(result.Events, sent)
-	return s.wait(ctx, timeout, result, timedOut)
+	return s.wait(ctx, m, timeout, result, timedOut)
 }
 
 // awaitStartup observes both process exit and Minecraft readiness. No signals or
 // retries are issued on startup failure, timeout, observer error, or cancellation.
-func (s Service) awaitStartup(ctx context.Context, timeout time.Duration, observer minecraft.Observer, result *Result) error {
+// A confirmed exit during startup also removes the new generation's state so a
+// retry is not blocked by a stale record.
+func (s Service) awaitStartup(ctx context.Context, m *mutation, timeout time.Duration, observer minecraft.Observer, result *Result) error {
 	child, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 	ticker := time.NewTicker(25 * time.Millisecond)
@@ -383,6 +426,9 @@ func (s Service) awaitStartup(ctx context.Context, timeout time.Duration, observ
 				return finish(fmt.Errorf("startup exit: %w", err))
 			}
 			result.Exit = &exit
+			if cleanErr := m.cleanExited(); cleanErr != nil {
+				return finish(fmt.Errorf("process exited before Minecraft startup completed (%s): %w", describeExit(exit), errors.Join(ErrStartupFailed, cleanErr)))
+			}
 			return fmt.Errorf("process exited before Minecraft startup completed (%s): %w", describeExit(exit), ErrStartupFailed)
 		}
 		if state == runtime.Running {

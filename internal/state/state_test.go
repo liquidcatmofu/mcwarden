@@ -15,11 +15,16 @@ import (
 
 func newStore(t *testing.T, server string) *Store {
 	t.Helper()
-	dir := t.TempDir()
-	if err := os.Chmod(dir, 0o700); err != nil {
+	stateDir := t.TempDir()
+	runtimeDir := t.TempDir()
+	if err := os.Chmod(stateDir, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	t.Setenv("XDG_RUNTIME_DIR", dir)
+	if err := os.Chmod(runtimeDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("XDG_STATE_HOME", stateDir)
+	t.Setenv("XDG_RUNTIME_DIR", runtimeDir)
 	store, err := Open(server)
 	if err != nil {
 		t.Fatalf("open: %v", err)
@@ -36,8 +41,11 @@ func selfIdentity(t *testing.T) Identity {
 	return Identity{PID: stat.PID, PGID: stat.PGID, StartTime: stat.StartTime}
 }
 
-func TestOpenCreatesPrivateDirectory(t *testing.T) {
+func TestSaveCreatesPrivateDirectory(t *testing.T) {
 	store := newStore(t, "rail")
+	if err := store.Save("direct", selfIdentity(t)); err != nil {
+		t.Fatal(err)
+	}
 	info, err := os.Stat(filepath.Dir(store.Path()))
 	if err != nil {
 		t.Fatal(err)
@@ -50,20 +58,29 @@ func TestOpenCreatesPrivateDirectory(t *testing.T) {
 	}
 }
 
-func TestOpenRejectsUnsafeRuntimeDir(t *testing.T) {
+func TestLockRejectsUnsafeRuntimeDir(t *testing.T) {
+	store := newStore(t, "rail")
 	dir := t.TempDir()
 	if err := os.Chmod(dir, 0o755); err != nil {
 		t.Fatal(err)
 	}
 	t.Setenv("XDG_RUNTIME_DIR", dir)
+	if _, err := store.Lock(); !errors.Is(err, ErrUnavailable) {
+		t.Fatalf("err=%v", err)
+	}
+}
+
+func TestOpenRejectsRelativeStateDir(t *testing.T) {
+	t.Setenv("XDG_STATE_HOME", "relative/path")
 	if _, err := Open("rail"); !errors.Is(err, ErrUnavailable) {
 		t.Fatalf("err=%v", err)
 	}
 }
 
-func TestOpenRejectsRelativeRuntimeDir(t *testing.T) {
+func TestLockRejectsRelativeRuntimeDir(t *testing.T) {
+	store := newStore(t, "rail")
 	t.Setenv("XDG_RUNTIME_DIR", "relative/path")
-	if _, err := Open("rail"); !errors.Is(err, ErrUnavailable) {
+	if _, err := store.Lock(); !errors.Is(err, ErrUnavailable) {
 		t.Fatalf("err=%v", err)
 	}
 }
@@ -238,6 +255,9 @@ func TestInspectUnknownOnBootError(t *testing.T) {
 
 func TestInspectCorrupt(t *testing.T) {
 	store := newStore(t, "rail")
+	if err := os.MkdirAll(filepath.Dir(store.Path()), 0o700); err != nil {
+		t.Fatal(err)
+	}
 	if err := os.WriteFile(store.Path(), []byte("{not json"), 0o600); err != nil {
 		t.Fatal(err)
 	}

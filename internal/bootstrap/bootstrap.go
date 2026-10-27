@@ -28,18 +28,22 @@ func Service(configPath, serverName string) (app.Service, error) {
 	if err != nil {
 		return app.Service{}, configError(err)
 	}
-	rt, err := runtimeFor(name, server)
+	store, err := state.Open(name)
+	if err != nil {
+		return app.Service{}, fmt.Errorf("server %q: %w", name, err)
+	}
+	rt, err := runtimeFor(name, server, store)
 	if err != nil {
 		return app.Service{}, err
 	}
 	return app.Service{
 		Runtime:     rt,
 		RuntimeName: "direct",
-		StateStore:  func() (*state.Store, error) { return state.Open(name) },
+		StateStore:  func() (*state.Store, error) { return store, nil },
 	}, nil
 }
 
-func runtimeFor(name string, server config.Server) (runtime.Runtime, error) {
+func runtimeFor(name string, server config.Server, store *state.Store) (runtime.Runtime, error) {
 	switch server.Runtime {
 	case "", "direct":
 	case "podman":
@@ -51,7 +55,7 @@ func runtimeFor(name string, server config.Server) (runtime.Runtime, error) {
 		return nil, configError(fmt.Errorf("server %q: missing direct config", name))
 	}
 	directConfig := server.Direct
-	adopt, err := adoptFor(name, directConfig)
+	adopt, err := adoptFor(name, directConfig, store)
 	if err != nil {
 		return nil, err
 	}
@@ -64,11 +68,19 @@ func runtimeFor(name string, server config.Server) (runtime.Runtime, error) {
 	}), nil
 }
 
-// adoptFor reads an optional pidfile. A missing pidfile or a missing process
-// means the server is not running, so no adoption is configured. The file may
-// contain "PID" or "PID STARTTIME"; when the start time is omitted it is read
-// from procfs immediately, which pins the process identity.
-func adoptFor(name string, directConfig *config.Direct) (*direct.Adopt, error) {
+// adoptFor rehydrates a persisted MCWarden-managed generation first, so a new
+// invocation can observe and signal the process that an earlier invocation
+// started. Persisted state takes precedence over a pidfile. Without usable
+// state, an optional pidfile is read; a missing pidfile or a missing process
+// means the server is not running, so no adoption is configured.
+func adoptFor(name string, directConfig *config.Direct, store *state.Store) (*direct.Adopt, error) {
+	persisted, err := adoptFromState(name, store)
+	if err != nil {
+		return nil, err
+	}
+	if persisted != nil {
+		return persisted, nil
+	}
 	if directConfig.PidFile == "" {
 		return nil, nil
 	}
@@ -105,6 +117,36 @@ func adoptFor(name string, directConfig *config.Direct) (*direct.Adopt, error) {
 		startTime = stat.StartTime
 	}
 	return &direct.Adopt{PID: pid, StartTime: startTime, SignalGroup: directConfig.SignalGroup}, nil
+}
+
+// adoptFromState builds an adoption target from a managed record. Stale and
+// absent state is left for status and state clean to handle. Unknown state is
+// still adopted so the runtime reports the unreadable process instead of
+// pretending it stopped, matching the "never treat unknown as stopped" rule.
+func adoptFromState(name string, store *state.Store) (*direct.Adopt, error) {
+	if store == nil {
+		return nil, nil
+	}
+	inspection, err := store.Inspect()
+	if err != nil {
+		return nil, fmt.Errorf("server %q: state: %w", name, err)
+	}
+	switch inspection.Status {
+	case state.Managed, state.Unknown:
+	default:
+		return nil, nil
+	}
+	rec := inspection.Record
+	if rec == nil {
+		return nil, fmt.Errorf("server %q: %s state has no process record", name, inspection.Status)
+	}
+	return &direct.Adopt{
+		PID:         rec.PID,
+		PGID:        rec.PGID,
+		StartTime:   rec.StartTime,
+		Owned:       rec.Owned,
+		SignalGroup: rec.SignalGroup,
+	}, nil
 }
 
 func configError(err error) error {

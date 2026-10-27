@@ -47,6 +47,7 @@ func (f *fake) Wait(ctx context.Context) (runtime.ExitStatus, error) {
 		return runtime.ExitStatus{}, ctx.Err()
 	}
 	if len(f.waits) == 0 {
+		f.state = runtime.Stopped
 		return runtime.ExitStatus{Code: 1}, nil
 	}
 	err := f.waits[0]
@@ -54,6 +55,9 @@ func (f *fake) Wait(ctx context.Context) (runtime.ExitStatus, error) {
 	if errors.Is(err, context.DeadlineExceeded) {
 		<-ctx.Done()
 		err = ctx.Err()
+	}
+	if err == nil {
+		f.state = runtime.Stopped
 	}
 	return runtime.ExitStatus{Code: 1}, err
 }
