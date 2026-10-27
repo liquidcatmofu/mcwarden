@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"os"
 	"testing"
+
+	"github.com/liquidcatmofu/mcwarden/internal/state"
 )
 
 func TestExitCode(t *testing.T) {
@@ -13,7 +15,7 @@ func TestExitCode(t *testing.T) {
 		err  error
 		code int
 	}{
-		{nil, 0}, {errors.New("unknown"), 1}, {ErrInvalid, 2}, {ErrConfig, 2}, {ErrNotRunning, 3},
+		{nil, 0}, {errors.New("unknown"), 1}, {ErrInvalid, 2}, {ErrConfig, 2}, {state.ErrUnavailable, 2}, {ErrNotRunning, 3},
 		{ErrTimeout, 4}, {context.DeadlineExceeded, 4}, {ErrUnsupported, 5},
 		{os.ErrPermission, 6}, {ErrConfirmation, 9}, {ErrExternal, 10}, {context.Canceled, 130},
 	} {

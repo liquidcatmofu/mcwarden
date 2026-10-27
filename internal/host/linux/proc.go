@@ -76,3 +76,18 @@ func parseStat(data []byte) (Process, error) {
 	}
 	return process, nil
 }
+
+// BootID returns the kernel boot identifier. A process identity stored in one
+// boot is meaningless after a reboot even if the PID and start time happen to
+// match, so persisted state records this value alongside them.
+func BootID() (string, error) {
+	data, err := os.ReadFile("/proc/sys/kernel/random/boot_id")
+	if err != nil {
+		return "", err
+	}
+	id := strings.TrimSpace(string(data))
+	if id == "" {
+		return "", fmt.Errorf("empty boot id")
+	}
+	return id, nil
+}

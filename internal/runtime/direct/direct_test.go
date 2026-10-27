@@ -48,6 +48,13 @@ func TestHelperProcess(t *testing.T) {
 			_ = os.WriteFile(path, []byte(strconv.Itoa(child.Process.Pid)), 0o644)
 		}
 		time.Sleep(time.Hour)
+	case "regroup":
+		writePidFile()
+		time.Sleep(time.Second)
+		if err := syscall.Setpgid(0, 0); err != nil {
+			os.Exit(2)
+		}
+		time.Sleep(time.Hour)
 	}
 	os.Exit(0)
 }
@@ -335,6 +342,101 @@ func TestAdoptGroupSignal(t *testing.T) {
 	waitGone(t, grandchild, 5*time.Second)
 }
 
+// TestIdentityReportsOwnedGeneration verifies that Start exposes the PID,
+// process group, and start time used for persisted state.
+func TestIdentityReportsOwnedGeneration(t *testing.T) {
+	rt := startOwned(t, helperConfig("sleep"))
+	id, ok := rt.Identity()
+	if !ok {
+		t.Fatal("no identity")
+	}
+	if !id.Owned || !id.SignalGroup {
+		t.Fatalf("identity=%+v", id)
+	}
+	stat := readStat(t, id.PID)
+	if id.PGID != stat.PGID || id.StartTime != stat.StartTime {
+		t.Fatalf("identity=%+v stat=%+v", id, stat)
+	}
+	if id.PID != id.PGID {
+		t.Fatalf("owned process is not its group leader: %+v", id)
+	}
+}
+
+// TestIdentityReportsAdoptedGeneration verifies that an adopted process keeps
+// the identity read from procfs.
+func TestIdentityReportsAdoptedGeneration(t *testing.T) {
+	pid, stop := startExternal(t, "sleep", "")
+	defer stop()
+	stat := readStat(t, pid)
+	rt := direct.New(direct.Config{Adopt: &direct.Adopt{PID: stat.PID, StartTime: stat.StartTime}})
+
+	id, ok := rt.Identity()
+	if !ok {
+		t.Fatal("no identity")
+	}
+	if id.Owned || id.PID != stat.PID || id.PGID != stat.PGID || id.StartTime != stat.StartTime {
+		t.Fatalf("identity=%+v stat=%+v", id, stat)
+	}
+}
+
+// TestAdoptGroupSignalRequiresLeader verifies that signal_group=true never
+// turns a process that merely belongs to a group into a group handle.
+func TestAdoptGroupSignalRequiresLeader(t *testing.T) {
+	cmd := exec.Command(os.Args[0], "-test.run=TestHelperProcess")
+	cmd.Env = append(os.Environ(), "MCWARDEN_DIRECT_HELPER=1", "MCWARDEN_DIRECT_MODE=sleep")
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("start external: %v", err)
+	}
+	defer func() {
+		cmd.Process.Kill()
+		cmd.Wait()
+	}()
+
+	stat := readStat(t, cmd.Process.Pid)
+	if stat.PGID == stat.PID {
+		t.Skip("helper unexpectedly leads its own group")
+	}
+	rt := direct.New(direct.Config{Adopt: &direct.Adopt{PID: stat.PID, StartTime: stat.StartTime, SignalGroup: true}})
+	if err := rt.Signal(context.Background(), runtime.Terminate); !errors.Is(err, direct.ErrIdentityChanged) {
+		t.Fatalf("err=%v", err)
+	}
+	if _, err := hostlinux.Read(stat.PID); err != nil {
+		t.Fatalf("process was signalled: %v", err)
+	}
+}
+
+// TestSignalRejectsMovedProcessGroup verifies that a process which changes its
+// process group after adoption is not signalled through the stale group id.
+func TestSignalRejectsMovedProcessGroup(t *testing.T) {
+	ctx := context.Background()
+	pid, stop := startExternalUngrouped(t, "regroup", "")
+	defer stop()
+
+	stat := readStat(t, pid)
+	rt := direct.New(direct.Config{Adopt: &direct.Adopt{PID: stat.PID, StartTime: stat.StartTime, SignalGroup: true}})
+	if state, err := rt.State(ctx); err != nil || state != runtime.Running {
+		t.Fatalf("state=%s err=%v", state, err)
+	}
+
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		got, err := hostlinux.Read(pid)
+		if err == nil && got.PGID == pid {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("process did not move to its own group: %+v err=%v", got, err)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if err := rt.Signal(ctx, runtime.Terminate); !errors.Is(err, direct.ErrIdentityChanged) {
+		t.Fatalf("err=%v", err)
+	}
+	if _, err := hostlinux.Read(pid); err != nil {
+		t.Fatalf("process was signalled: %v", err)
+	}
+}
+
 // startExternal launches a helper outside any Runtime and returns its PID and a
 // cleanup function.
 func startExternal(t *testing.T, mode, pidfile string) (int, func()) {
@@ -357,6 +459,31 @@ func startExternal(t *testing.T, mode, pidfile string) (int, func()) {
 	return cmd.Process.Pid, func() {
 		// Kill the whole group so children do not linger.
 		_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+		<-reaped
+	}
+}
+
+// startExternalUngrouped launches a helper in the caller's process group. It is
+// used when a test needs the helper to change groups itself.
+func startExternalUngrouped(t *testing.T, mode, pidfile string) (int, func()) {
+	t.Helper()
+	cmd := exec.Command(os.Args[0], "-test.run=TestHelperProcess")
+	env := append(os.Environ(), "MCWARDEN_DIRECT_HELPER=1", "MCWARDEN_DIRECT_MODE="+mode)
+	if pidfile != "" {
+		env = append(env, "MCWARDEN_DIRECT_PIDFILE="+pidfile)
+	}
+	cmd.Env = env
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("start external: %v", err)
+	}
+	reaped := make(chan struct{})
+	go func() {
+		cmd.Wait()
+		close(reaped)
+	}()
+	return cmd.Process.Pid, func() {
+		_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+		_ = cmd.Process.Kill()
 		<-reaped
 	}
 }

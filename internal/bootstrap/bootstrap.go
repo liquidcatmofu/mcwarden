@@ -13,6 +13,7 @@ import (
 	hostlinux "github.com/liquidcatmofu/mcwarden/internal/host/linux"
 	"github.com/liquidcatmofu/mcwarden/internal/runtime"
 	"github.com/liquidcatmofu/mcwarden/internal/runtime/direct"
+	"github.com/liquidcatmofu/mcwarden/internal/state"
 )
 
 // Service loads configPath (or the default path), selects serverName, and
@@ -31,7 +32,11 @@ func Service(configPath, serverName string) (app.Service, error) {
 	if err != nil {
 		return app.Service{}, err
 	}
-	return app.Service{Runtime: rt}, nil
+	return app.Service{
+		Runtime:     rt,
+		RuntimeName: "direct",
+		StateStore:  func() (*state.Store, error) { return state.Open(name) },
+	}, nil
 }
 
 func runtimeFor(name string, server config.Server) (runtime.Runtime, error) {

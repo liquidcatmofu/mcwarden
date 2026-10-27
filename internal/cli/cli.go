@@ -12,12 +12,14 @@ import (
 	"time"
 
 	"github.com/liquidcatmofu/mcwarden/internal/app"
+	"github.com/liquidcatmofu/mcwarden/internal/state"
 )
 
 const usage = `Usage: mcwarden [global options] <command> [options]
 
-Commands: status, stop, restart, version, help
+Commands: status, stop, restart, state, version, help
 Global options: -c, --config <path>  -s, --server <name>  --json
+State: state show | state clean
 Stop: --stop-timeout=120s
 Restart: --stop-timeout=120s --term [--term-timeout=30s]
          --kill --force [--kill-timeout=10s]
@@ -65,6 +67,9 @@ func Run(ctx context.Context, args []string, out, stderr io.Writer, load Loader)
 		}
 		_, err := fmt.Fprintln(out, "mcwarden dev")
 		return app.ExitCode(err)
+	}
+	if command == "state" {
+		return runState(ctx, rest[1:], globals, out, stderr, load)
 	}
 	if command != "status" && command != "stop" && command != "restart" {
 		fmt.Fprintf(stderr, "unknown command: %s\n", command)
@@ -122,8 +127,38 @@ func Run(ctx context.Context, args []string, out, stderr io.Writer, load Loader)
 			}
 		}
 	}
+	return output(out, stderr, *asJSON || globals.json, data, err)
+}
+
+// runState handles the state subcommands. They have no command-specific flags;
+// global options are already extracted.
+func runState(ctx context.Context, args []string, globals globalOptions, out, stderr io.Writer, load Loader) int {
+	if len(args) != 1 || (args[0] != "show" && args[0] != "clean") {
+		fmt.Fprintln(stderr, "usage: mcwarden state show|clean")
+		return 2
+	}
+	var data any
+	service, err := load(globals.config, globals.server)
+	if err == nil {
+		var inspection state.Inspection
+		switch args[0] {
+		case "show":
+			inspection, err = service.StateStatus(ctx)
+		case "clean":
+			inspection, err = service.CleanState(ctx)
+		}
+		if err == nil || inspection.Status != "" {
+			data = inspection
+		}
+	}
+	return output(out, stderr, globals.json, data, err)
+}
+
+// output writes either the JSON envelope or the human-readable form and returns
+// the mapped exit code.
+func output(out, stderr io.Writer, asJSON bool, data any, err error) int {
 	code := app.ExitCode(err)
-	if *asJSON || globals.json {
+	if asJSON {
 		result := response{Data: data, ExitCode: code}
 		if err != nil {
 			result.Error = err.Error()
@@ -131,28 +166,38 @@ func Run(ctx context.Context, args []string, out, stderr io.Writer, load Loader)
 		if writeErr := json.NewEncoder(out).Encode(result); writeErr != nil {
 			return app.ExitCode(writeErr)
 		}
-	} else {
-		if err != nil {
-			fmt.Fprintln(stderr, err)
+		return code
+	}
+	if err != nil {
+		fmt.Fprintln(stderr, err)
+	}
+	if data != nil {
+		var writeErr error
+		switch value := data.(type) {
+		case app.Status:
+			_, writeErr = fmt.Fprintf(out, "Runtime  %s\nMinecraft  %s\n", value.Runtime.State, value.Minecraft.State)
+			if writeErr == nil && value.Minecraft.Error != "" {
+				_, writeErr = fmt.Fprintf(out, "Minecraft  %s\n", value.Minecraft.Error)
+			}
+		case app.Result:
+			for _, phase := range value.Events {
+				if _, writeErr = fmt.Fprintln(out, phase); writeErr != nil {
+					break
+				}
+			}
+		case state.Inspection:
+			_, writeErr = fmt.Fprintf(out, "State  %s\n", value.Status)
+			if writeErr == nil && value.Reason != "" {
+				_, writeErr = fmt.Fprintf(out, "Reason  %s\n", value.Reason)
+			}
+			if writeErr == nil && value.Record != nil {
+				record := value.Record
+				_, writeErr = fmt.Fprintf(out, "Server  %s\nRuntime  %s\nPID  %d\nPGID  %d\nStart time  %d\nBoot ID  %s\n",
+					record.Server, record.Runtime, record.PID, record.PGID, record.StartTime, record.BootID)
+			}
 		}
-		if data != nil {
-			var writeErr error
-			switch value := data.(type) {
-			case app.Status:
-				_, writeErr = fmt.Fprintf(out, "Runtime  %s\nMinecraft  %s\n", value.Runtime.State, value.Minecraft.State)
-				if writeErr == nil && value.Minecraft.Error != "" {
-					_, writeErr = fmt.Fprintf(out, "Minecraft  %s\n", value.Minecraft.Error)
-				}
-			case app.Result:
-				for _, phase := range value.Events {
-					if _, writeErr = fmt.Fprintln(out, phase); writeErr != nil {
-						break
-					}
-				}
-			}
-			if writeErr != nil {
-				return app.ExitCode(writeErr)
-			}
+		if writeErr != nil {
+			return app.ExitCode(writeErr)
 		}
 	}
 	return code

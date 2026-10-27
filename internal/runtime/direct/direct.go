@@ -48,6 +48,10 @@ var (
 	ErrUnsupported = errors.New("unsupported operation")
 	// ErrInvalid is returned for an unusable configuration.
 	ErrInvalid = errors.New("invalid configuration")
+	// ErrIdentityChanged is returned when procfs no longer matches the PID,
+	// start time, or process group recorded for a generation, for example
+	// because the PID was reused or the process moved to another group.
+	ErrIdentityChanged = errors.New("process identity changed")
 )
 
 // Adopt targets a process this Runtime did not start.
@@ -94,6 +98,7 @@ type Runtime struct {
 }
 
 var _ runtime.Runtime = (*Runtime)(nil)
+var _ runtime.Identifiable = (*Runtime)(nil)
 
 // New returns a Runtime for cfg. It does not launch anything; Start or a first
 // observation does.
@@ -189,6 +194,46 @@ func (r *Runtime) resolve() (*process, error) {
 		group:     r.cfg.Adopt.SignalGroup,
 	}
 	return r.proc, nil
+}
+
+// Identity reports the generation this Runtime is tracking. It returns false
+// when there is no live generation or its start time could not be observed.
+// Reporting an identity never launches or adopts a process.
+func (r *Runtime) Identity() (runtime.Identity, bool) {
+	p, err := r.resolve()
+	if err != nil || p == nil {
+		return runtime.Identity{}, false
+	}
+	if p.owned {
+		select {
+		case <-p.done:
+			return runtime.Identity{}, false
+		default:
+		}
+	} else {
+		alive, err := p.adoptedAlive()
+		if err != nil || !alive {
+			return runtime.Identity{}, false
+		}
+	}
+	if p.startTime == 0 {
+		stat, err := procRead(p.pid)
+		if err != nil {
+			return runtime.Identity{}, false
+		}
+		p.startTime = stat.StartTime
+		p.pgid = stat.PGID
+	}
+	if p.startTime == 0 {
+		return runtime.Identity{}, false
+	}
+	return runtime.Identity{
+		PID:         p.pid,
+		PGID:        p.pgid,
+		StartTime:   p.startTime,
+		Owned:       p.owned,
+		SignalGroup: p.group,
+	}, true
 }
 
 // Start launches the configured command in a new process group. Success means
@@ -291,7 +336,9 @@ func (r *Runtime) State(ctx context.Context) (runtime.State, error) {
 
 // Signal delivers a signal to the current generation. Owned processes are
 // signalled through their process group; adopted ones only reach the group when
-// explicitly allowed.
+// explicitly allowed. Immediately before signalling, the PID, start time, and
+// process group are re-read from procfs so a reused PID or a moved process is
+// never targeted.
 func (r *Runtime) Signal(ctx context.Context, sig runtime.Signal) error {
 	if err := ctx.Err(); err != nil {
 		return err
@@ -307,12 +354,8 @@ func (r *Runtime) Signal(ctx context.Context, sig runtime.Signal) error {
 	if p == nil {
 		return ErrNotStarted
 	}
-	gone, err := p.gone()
-	if err != nil {
+	if err := r.verifySignal(p); err != nil {
 		return err
-	}
-	if gone {
-		return ErrNotStarted
 	}
 	target := p.pid
 	if p.owned || p.group {
@@ -320,6 +363,48 @@ func (r *Runtime) Signal(ctx context.Context, sig runtime.Signal) error {
 	}
 	if err := syscall.Kill(target, native); err != nil {
 		return fmt.Errorf("signal %s: %w", sig, err)
+	}
+	return nil
+}
+
+// verifySignal re-reads procfs right before a signal. Group signalling also
+// requires the process to still lead that group, so an adopted PID that merely
+// belongs to someone else's group is never used as a group handle. Callers
+// serialize lifecycle operations, so updating an unidentified start time here
+// does not race with another Signal.
+func (r *Runtime) verifySignal(p *process) error {
+	if p.owned {
+		select {
+		case <-p.done:
+			return ErrNotStarted
+		default:
+		}
+	}
+	stat, err := procRead(p.pid)
+	if hostlinux.IsGone(err) {
+		return ErrNotStarted
+	}
+	if err != nil {
+		return fmt.Errorf("verify process %d: %w", p.pid, err)
+	}
+	switch stat.State {
+	case 'Z', 'X':
+		return ErrNotStarted
+	}
+	if p.startTime == 0 {
+		p.startTime = stat.StartTime
+	} else if stat.StartTime != p.startTime {
+		return fmt.Errorf("pid %d now belongs to a different process: %w", p.pid, ErrIdentityChanged)
+	}
+	if p.pgid == 0 {
+		p.pgid = stat.PGID
+	} else if stat.PGID != p.pgid {
+		return fmt.Errorf("process %d moved to process group %d: %w", p.pid, stat.PGID, ErrIdentityChanged)
+	}
+	if p.owned || p.group {
+		if p.pgid != p.pid {
+			return fmt.Errorf("process %d is not a process group leader (pgid %d): %w", p.pid, p.pgid, ErrIdentityChanged)
+		}
 	}
 	return nil
 }

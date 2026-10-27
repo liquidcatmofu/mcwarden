@@ -5,9 +5,11 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"os"
 	"testing"
 
 	"github.com/liquidcatmofu/mcwarden/internal/app"
+	"github.com/liquidcatmofu/mcwarden/internal/state"
 )
 
 func staticService(service app.Service) Loader {
@@ -120,6 +122,66 @@ func TestHelpAndVersionSkipLoader(t *testing.T) {
 		if code := Run(context.Background(), args, &out, &stderr, load); code != 0 {
 			t.Fatalf("%v: code=%d stderr=%s", args, code, &stderr)
 		}
+	}
+}
+
+func TestStateCommands(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.Chmod(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("XDG_RUNTIME_DIR", dir)
+	service := app.Service{StateStore: func() (*state.Store, error) { return state.Open("rail") }}
+
+	for _, args := range [][]string{
+		{"state", "show", "--json"},
+		{"--json", "state", "show"},
+		{"state", "clean", "--json"},
+	} {
+		t.Run(join(args), func(t *testing.T) {
+			var out, stderr bytes.Buffer
+			code := Run(context.Background(), args, &out, &stderr, staticService(service))
+			if code != 0 || stderr.Len() != 0 {
+				t.Fatalf("code=%d stderr=%s", code, &stderr)
+			}
+			var result struct {
+				Data     state.Inspection `json:"data"`
+				ExitCode int              `json:"exit_code"`
+			}
+			if err := json.Unmarshal(out.Bytes(), &result); err != nil {
+				t.Fatal(err)
+			}
+			if result.ExitCode != 0 || result.Data.Status != state.Absent {
+				t.Fatalf("result=%+v", result)
+			}
+		})
+	}
+}
+
+func TestStateCommandErrors(t *testing.T) {
+	for _, args := range [][]string{
+		{"state"},
+		{"state", "bogus"},
+		{"state", "show", "extra"},
+	} {
+		t.Run(join(args), func(t *testing.T) {
+			var out, stderr bytes.Buffer
+			code := Run(context.Background(), args, &out, &stderr, staticService(app.Service{}))
+			if code != 2 || stderr.Len() == 0 {
+				t.Fatalf("code=%d stderr=%s", code, &stderr)
+			}
+		})
+	}
+}
+
+func TestStateLoaderError(t *testing.T) {
+	load := func(string, string) (app.Service, error) {
+		return app.Service{}, fmt.Errorf("%w: boom", app.ErrConfig)
+	}
+	var out, stderr bytes.Buffer
+	code := Run(context.Background(), []string{"state", "show", "--json"}, &out, &stderr, load)
+	if code != 2 || stderr.Len() != 0 {
+		t.Fatalf("code=%d stderr=%s", code, &stderr)
 	}
 }
 

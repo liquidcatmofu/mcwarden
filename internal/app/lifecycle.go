@@ -8,6 +8,7 @@ import (
 
 	"github.com/liquidcatmofu/mcwarden/internal/minecraft"
 	"github.com/liquidcatmofu/mcwarden/internal/runtime"
+	"github.com/liquidcatmofu/mcwarden/internal/state"
 )
 
 var errWaitTimeout = errors.New("lifecycle wait deadline exceeded")
@@ -62,6 +63,11 @@ type Result struct {
 type Service struct {
 	Runtime   runtime.Runtime
 	Minecraft minecraft.Control
+	// RuntimeName is stored in state, for example "direct".
+	RuntimeName string
+	// StateStore opens the persisted identity store. Bootstrap sets it; a nil
+	// value disables persistence for tests and runtimes without a host process.
+	StateStore func() (*state.Store, error)
 }
 
 func (s Service) requireRunning(ctx context.Context) error {
@@ -130,6 +136,130 @@ func (s Service) wait(ctx context.Context, timeout time.Duration, result *Result
 	return nil
 }
 
+// Start validates persisted state, locks the server, launches the process, and
+// persists the new generation's identity. It returns after process launch; it
+// does not wait for Minecraft readiness.
+func (s Service) Start(ctx context.Context) (Result, error) {
+	result := Result{Events: []Event{}, State: minecraft.Unknown}
+	if err := ctx.Err(); err != nil {
+		return result, err
+	}
+	result.Events = append(result.Events, StartRequested)
+	if err := s.startProcess(ctx); err != nil {
+		return result, err
+	}
+	result.Events = append(result.Events, ProcessStarted)
+	result.State = minecraft.Starting
+	return result, nil
+}
+
+// startProcess is shared by Start and Restart. When state is configured it
+// holds the server lock across validation, launch, and save:
+//
+//   - managed state means the process is still the recorded generation;
+//   - stale state must be cleaned explicitly;
+//   - unknown state is never treated as stopped;
+//   - absent state still checks the runtime, which covers pidfile adoption.
+//
+// If the identity cannot be saved after launch, the new process is stopped
+// again rather than left untracked, because an untracked process would allow a
+// later invocation to start a second one.
+func (s Service) startProcess(ctx context.Context) error {
+	if s.Runtime == nil {
+		return ErrUnsupported
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if s.StateStore == nil {
+		return s.Runtime.Start(ctx)
+	}
+	store, err := s.StateStore()
+	if err != nil {
+		return fmt.Errorf("state: %w", err)
+	}
+	lock, err := store.Lock()
+	if err != nil {
+		return fmt.Errorf("state lock: %w", err)
+	}
+	defer lock.Unlock()
+
+	inspection, err := store.Inspect()
+	if err != nil {
+		return fmt.Errorf("state: %w", err)
+	}
+	switch inspection.Status {
+	case state.Managed:
+		return fmt.Errorf("%w: %s", ErrAlreadyRunning, inspection.Reason)
+	case state.Unknown:
+		return fmt.Errorf("%w: %s", ErrStateUnknown, inspection.Reason)
+	case state.Stale:
+		return fmt.Errorf("%w: %s; run mcwarden state clean", ErrStaleState, inspection.Reason)
+	}
+
+	runtimeState, err := s.Runtime.State(ctx)
+	if err != nil {
+		return fmt.Errorf("runtime state: %w", err)
+	}
+	switch runtimeState {
+	case runtime.Stopped:
+	case runtime.Running:
+		return fmt.Errorf("%w: runtime reports a running process", ErrAlreadyRunning)
+	default:
+		return fmt.Errorf("cannot start while runtime state is %q: %w", runtimeState, ErrStateUnknown)
+	}
+	if err := s.Runtime.Start(ctx); err != nil {
+		return fmt.Errorf("start: %w", err)
+	}
+
+	identity, ok := s.identity()
+	if !ok {
+		rollbackErr := s.rollbackStart(ctx)
+		return fmt.Errorf("%w: runtime did not report process identity (rollback: %v)", ErrStateUnknown, rollbackErr)
+	}
+	runtimeName := s.RuntimeName
+	if runtimeName == "" {
+		runtimeName = "direct"
+	}
+	if err := store.Save(runtimeName, identity); err != nil {
+		rollbackErr := s.rollbackStart(ctx)
+		return fmt.Errorf("save process state: %w (rollback: %v)", err, rollbackErr)
+	}
+	return nil
+}
+
+func (s Service) identity() (state.Identity, bool) {
+	identifiable, ok := s.Runtime.(runtime.Identifiable)
+	if !ok {
+		return state.Identity{}, false
+	}
+	id, ok := identifiable.Identity()
+	if !ok {
+		return state.Identity{}, false
+	}
+	return state.Identity{
+		PID:         id.PID,
+		PGID:        id.PGID,
+		StartTime:   id.StartTime,
+		Owned:       id.Owned,
+		SignalGroup: id.SignalGroup,
+	}, true
+}
+
+// rollbackStart stops a freshly started process whose identity could not be
+// persisted. It uses its own deadline so caller cancellation cannot leave the
+// process untracked.
+func (s Service) rollbackStart(ctx context.Context) error {
+	if ctx.Err() != nil {
+		ctx = context.Background()
+	}
+	child, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	signalErr := s.Runtime.Signal(child, runtime.Kill)
+	_, waitErr := s.Runtime.Wait(child)
+	return errors.Join(signalErr, waitErr)
+}
+
 // Stop never sends OS signals, even on timeout or transport failure.
 func (s Service) Stop(ctx context.Context, opts StopOptions) (Result, error) {
 	result := Result{Events: []Event{}, State: minecraft.Unknown}
@@ -183,8 +313,8 @@ func (s Service) Restart(ctx context.Context, opts RestartOptions) (Result, erro
 		return result, err
 	}
 	result.Events = append(result.Events, StartRequested)
-	if err := s.Runtime.Start(ctx); err != nil {
-		return result, fmt.Errorf("start: %w", err)
+	if err := s.startProcess(ctx); err != nil {
+		return result, err
 	}
 	result.Events = append(result.Events, ProcessStarted)
 	result.State = minecraft.Starting
