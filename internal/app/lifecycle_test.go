@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/liquidcatmofu/mcwarden/internal/minecraft"
+	"github.com/liquidcatmofu/mcwarden/internal/minecraft/rcon"
 	"github.com/liquidcatmofu/mcwarden/internal/runtime"
 )
 
@@ -192,6 +193,24 @@ func TestRCONCommandFailureDoesNotEscalate(t *testing.T) {
 		Escalation: WithKill, AllowSIGKILL: true,
 	})
 	if !errors.Is(err, errTransport) {
+		t.Fatalf("err=%v", err)
+	}
+	for _, call := range f.calls {
+		if call == "term" || call == "kill" || call == "start" {
+			t.Fatalf("unexpected escalation or start: %v", f.calls)
+		}
+	}
+}
+
+// Missing or empty RCON credentials are command transport errors, not wait
+// timeouts, so they must not trigger signal escalation either.
+func TestRCONCredentialFailureDoesNotEscalate(t *testing.T) {
+	f := &fake{state: runtime.Running, commandErr: rcon.ErrEmptyPassword}
+	_, err := (Service{Runtime: f, Minecraft: f}).Restart(context.Background(), RestartOptions{
+		NoWait: true, StopTimeout: time.Second, TermTimeout: time.Second, KillTimeout: time.Second,
+		Escalation: WithKill, AllowSIGKILL: true,
+	})
+	if !errors.Is(err, rcon.ErrEmptyPassword) {
 		t.Fatalf("err=%v", err)
 	}
 	for _, call := range f.calls {

@@ -113,7 +113,7 @@ func TestServiceWithoutMinecraftControl(t *testing.T) {
 	}
 }
 
-func TestServiceRejectsInvalidRCONPassword(t *testing.T) {
+func TestServiceDefersRCONCredentialErrors(t *testing.T) {
 	for name, content := range map[string]string{
 		"empty":        "\n",
 		"empty crlf":   "\r\n",
@@ -136,11 +136,55 @@ control = "rcon"
 [servers.rail.minecraft.rcon]
 password_file = %q
 `, passwordFile))
-			if _, err := Service(path, ""); !errors.Is(err, app.ErrConfig) {
-				t.Fatalf("err=%v want config error", err)
+			service, err := Service(path, "")
+			if err != nil {
+				t.Fatalf("bootstrap must not read credentials: %v", err)
+			}
+			if _, err := service.Status(context.Background()); err != nil {
+				t.Fatalf("status must work without credentials: %v", err)
+			}
+			if _, err := service.StateStatus(context.Background()); err != nil {
+				t.Fatalf("state inspection must work without credentials: %v", err)
+			}
+			err = service.Minecraft.Command(context.Background(), "stop")
+			if name == "missing file" {
+				if !errors.Is(err, os.ErrNotExist) {
+					t.Fatalf("err=%v want missing password file", err)
+				}
+			} else if !errors.Is(err, rcon.ErrEmptyPassword) {
+				t.Fatalf("err=%v want empty password", err)
 			}
 		})
 	}
+}
+
+func TestServiceStartsWithoutRCONCredentials(t *testing.T) {
+	if _, err := os.Stat("/bin/sleep"); err != nil {
+		t.Skip("/bin/sleep is required")
+	}
+	passwordFile := filepath.Join(t.TempDir(), "absent")
+	path := writeConfig(t, fmt.Sprintf(`
+[servers.rail.direct]
+command = "/bin/sleep"
+args = ["60"]
+
+[servers.rail.minecraft]
+control = "rcon"
+
+[servers.rail.minecraft.rcon]
+password_file = %q
+`, passwordFile))
+	service, err := Service(path, "")
+	if err != nil {
+		t.Fatalf("bootstrap: %v", err)
+	}
+	if _, err := service.Start(context.Background(), app.StartOptions{NoWait: true}); err != nil {
+		t.Fatalf("start --no-wait must not need RCON credentials: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = service.Runtime.Signal(context.Background(), runtime.Kill)
+		_, _ = service.Runtime.Wait(context.Background())
+	})
 }
 
 func TestServiceAdoptsPidfile(t *testing.T) {

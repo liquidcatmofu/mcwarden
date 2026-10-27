@@ -18,6 +18,20 @@ import (
 
 const testPassword = "correct horse battery staple"
 
+func writePasswordFile(t *testing.T, content string) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "rcon-password")
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+func testPasswordFile(t *testing.T) string {
+	t.Helper()
+	return writePasswordFile(t, testPassword+"\n")
+}
+
 func startFakeServer(t *testing.T, handler func(net.Conn) error) string {
 	t.Helper()
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
@@ -122,7 +136,7 @@ func TestCommandAuthenticatesAndSendsPacket(t *testing.T) {
 		return nil
 	})
 
-	client := New(address, testPassword)
+	client := New(address, testPasswordFile(t))
 	if err := client.Command(context.Background(), "stop"); err != nil {
 		reportPasswordSafe(t, "command", err)
 	}
@@ -137,7 +151,7 @@ func TestCommandAuthenticatesAndSendsPacket(t *testing.T) {
 }
 
 func TestCapabilities(t *testing.T) {
-	client := New("", testPassword)
+	client := New("", testPasswordFile(t))
 	caps, err := client.Capabilities(context.Background())
 	if err != nil {
 		t.Fatal(err)
@@ -148,7 +162,7 @@ func TestCapabilities(t *testing.T) {
 }
 
 func TestClientFormattingDoesNotExposePassword(t *testing.T) {
-	client := New("127.0.0.1:25575", testPassword)
+	client := New("127.0.0.1:25575", testPasswordFile(t))
 	for _, format := range []string{"%v", "%+v", "%#v"} {
 		if text := fmt.Sprintf(format, client); strings.Contains(text, testPassword) {
 			t.Fatalf("%s formatting exposed the password", format)
@@ -163,7 +177,7 @@ func TestAuthenticationFailure(t *testing.T) {
 		}
 		return writeTestPacket(conn, -1, typeAuthResponse, nil)
 	})
-	err := New(address, testPassword).Command(context.Background(), "stop")
+	err := New(address, testPasswordFile(t)).Command(context.Background(), "stop")
 	if !errors.Is(err, ErrAuthentication) {
 		reportPasswordSafe(t, "authentication error", err)
 	}
@@ -175,9 +189,94 @@ func TestAuthenticationFailure(t *testing.T) {
 func TestContextCanceledBeforeDial(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	err := New("127.0.0.1:1", testPassword).Command(ctx, "stop")
+	err := New("127.0.0.1:1", testPasswordFile(t)).Command(ctx, "stop")
 	if !errors.Is(err, context.Canceled) {
 		reportPasswordSafe(t, "canceled command", err)
+	}
+}
+
+func TestContextCanceledDuringAuth(t *testing.T) {
+	authSeen := make(chan struct{})
+	address := startFakeServer(t, func(conn net.Conn) error {
+		if _, _, _, err := readTestPacket(t, conn); err != nil {
+			return err
+		}
+		close(authSeen)
+		_, _ = io.Copy(io.Discard, conn)
+		return nil
+	})
+	passwordFile := testPasswordFile(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() {
+		done <- New(address, passwordFile).Command(ctx, "stop")
+	}()
+	select {
+	case <-authSeen:
+	case <-time.After(time.Second):
+		t.Fatal("server did not receive the auth packet")
+	}
+	cancel()
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			reportPasswordSafe(t, "canceled during auth", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("command did not stop after cancellation")
+	}
+}
+
+func TestCommandPasswordFileErrors(t *testing.T) {
+	missing := filepath.Join(t.TempDir(), "absent")
+	err := New("127.0.0.1:1", missing).Command(context.Background(), "stop")
+	if !errors.Is(err, os.ErrNotExist) {
+		reportPasswordSafe(t, "missing password file", err)
+	}
+
+	empty := writePasswordFile(t, "\n")
+	err = New("127.0.0.1:1", empty).Command(context.Background(), "stop")
+	if !errors.Is(err, ErrEmptyPassword) {
+		reportPasswordSafe(t, "empty password file", err)
+	}
+}
+
+func TestCommandReadsPasswordFileLazily(t *testing.T) {
+	commands := make(chan string, 1)
+	address := startFakeServer(t, func(conn net.Conn) error {
+		id, _, payload, err := readTestPacket(t, conn)
+		if err != nil {
+			return err
+		}
+		if string(payload) != testPassword {
+			return errors.New("auth password mismatch")
+		}
+		if err := writeTestPacket(conn, id, typeAuthResponse, nil); err != nil {
+			return err
+		}
+		_, _, payload, err = readTestPacket(t, conn)
+		if err != nil {
+			return err
+		}
+		commands <- string(payload)
+		return nil
+	})
+	passwordFile := filepath.Join(t.TempDir(), "rcon-password")
+	client := New(address, passwordFile)
+	if err := os.WriteFile(passwordFile, []byte(testPassword+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := client.Command(context.Background(), "stop"); err != nil {
+		reportPasswordSafe(t, "lazy password read", err)
+	}
+	select {
+	case got := <-commands:
+		if got != "stop" {
+			t.Fatalf("command=%q want stop", got)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("server did not receive the command packet")
 	}
 }
 
@@ -191,7 +290,7 @@ func TestAuthResponseDeadline(t *testing.T) {
 	})
 	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
 	defer cancel()
-	err := New(address, testPassword).Command(ctx, "stop")
+	err := New(address, testPasswordFile(t)).Command(ctx, "stop")
 	if !errors.Is(err, context.DeadlineExceeded) {
 		reportPasswordSafe(t, "deadline", err)
 	}
@@ -226,7 +325,7 @@ func TestMalformedPacket(t *testing.T) {
 				}
 				return nil
 			})
-			err := New(address, testPassword).Command(context.Background(), "stop")
+			err := New(address, testPasswordFile(t)).Command(context.Background(), "stop")
 			if !errors.Is(err, tt.want) {
 				reportPasswordSafe(t, tt.name, err)
 			}
@@ -239,7 +338,7 @@ func TestServerDisconnect(t *testing.T) {
 		_, _, _, err := readTestPacket(t, conn)
 		return err
 	})
-	err := New(address, testPassword).Command(context.Background(), "stop")
+	err := New(address, testPasswordFile(t)).Command(context.Background(), "stop")
 	if err == nil {
 		t.Fatal("expected a disconnect error")
 	}

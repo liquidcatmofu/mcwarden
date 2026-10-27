@@ -57,7 +57,9 @@ func Service(configPath, serverName string) (app.Service, error) {
 
 // minecraftControlFor builds the configured command transport. A missing
 // [servers.<name>.minecraft] table leaves control unsupported; configuration
-// validation rejects a control name without its required settings.
+// validation rejects a control name without its required settings. Credentials
+// are read lazily by the RCON adapter so an unavailable password file does not
+// block status or state inspection.
 func minecraftControlFor(name string, server config.Server) (minecraft.Control, error) {
 	if server.Minecraft == nil {
 		return nil, nil
@@ -68,11 +70,7 @@ func minecraftControlFor(name string, server config.Server) (minecraft.Control, 
 		if settings == nil {
 			return nil, configError(fmt.Errorf("server %q: missing minecraft.rcon config", name))
 		}
-		password, err := rcon.LoadPassword(expandHome(settings.PasswordFile))
-		if err != nil {
-			return nil, configError(fmt.Errorf("server %q: %w", name, err))
-		}
-		return rcon.New(settings.Address, password), nil
+		return rcon.New(settings.Address, expandHome(settings.PasswordFile)), nil
 	default:
 		return nil, configError(fmt.Errorf("server %q: unknown minecraft control %q", name, server.Minecraft.Control))
 	}

@@ -55,6 +55,8 @@ mcwarden status -s rail --json
 
 RCONはMinecraftへのcommand transport専用です。Runtimeがプロセスのライフサイクルを所有し、RCONはコマンド送信だけを担当します。RCON adapterにRuntimeの所有権はありません。
 
+RCONはplaintext transportです。loopback、または信頼できる暗号化されたネットワーク内でのみ使用し、インターネットへ直接公開しないでください。
+
 `mcwarden stop`はRCONで`stop`を送信したあと、`Runtime.Wait`でプロセス終了を待ちます。タイムアウトしても`stop`自身はSIGTERM/SIGKILLへescalateしません。通信失敗・認証失敗・呼び出し元のキャンセルもescalationの理由にしません。
 
 `mcwarden restart --no-wait`は次の順に進みます。
@@ -79,7 +81,8 @@ RCON接続成功をMinecraft lifecycleの`Running`証拠にはしません。`pr
 RCON passwordはCLI引数やTOMLへ直接書かず、`password_file`から読みます。ファイルはMCWardenを実行するユーザーだけが読める権限にしてください。
 
 - 末尾の`\n`または`\r\n`だけを除去します。空白などそれ以外の文字はtrimしません。
-- 除去後に空になるpasswordは設定/bootstrapエラーです。
+- 除去後に空になるpasswordはcredential errorです。`stop` / `restart --no-wait`などMinecraft Controlを必要とする操作だけが失敗し、`status`・`state show`・`start --no-wait`は妨げません。
+- password fileの読み込みは各RCON `Command`実行時まで遅延します。
 - passwordそのものはerror、JSON output、log、テストの失敗メッセージへ出しません。
 - `server.properties`の自動解析は行いません。
 

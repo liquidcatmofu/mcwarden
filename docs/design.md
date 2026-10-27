@@ -50,7 +50,9 @@ Runtimeの状態取得失敗はエラー。Minecraft側の取得失敗は部分�
 - packetはlittle-endianのlength、request id、type、payload、終端2バイトで構成する。lengthは10未満と上限超過をallocate前に拒否し、truncated packetやmalformed packetは安全にエラーにする。
 - context deadlineはsocket deadlineへ反映する。deadlineが無いキャンセルでも、connectionをcloseしてdial/read/writeの待機を中断する。
 - authentication failureは専用の`ErrAuthentication`として識別する。通信失敗・認証失敗・キャンセルは`errWaitTimeout`ではないため、`stop`/`restart`のsignal escalationを引き起こさない。
-- passwordは`password_file`から読み、CLI引数やTOMLへ置かない。末尾の`\n`または`\r\n`だけを除去し、それ以外はtrimしない。空passwordは設定/bootstrapエラー。passwordはerror・JSON・log・テスト失敗メッセージへ出さない。`server.properties`は解析しない。
+- passwordは`password_file`から読み、CLI引数やTOMLへ置かない。末尾の`\n`または`\r\n`だけを除去し、それ以外はtrimしない。空passwordはcredential error。passwordはerror・JSON・log・テスト失敗メッセージへ出さない。`server.properties`は解析しない。
+- `password_file`の読み込みは各`Command`実行時まで遅延する。credentialの不在・読取不能・空passwordはMinecraft Controlのエラーであり、`status`・`state show`・`start --no-wait`を妨げない。credential errorもwait timeoutではないためsignal escalationを引き起こさない。
+- RCONはplaintext transportである。loopbackまたは信頼できる暗号化ネットワーク内でのみ使い、インターネットへ直接公開しない。
 
 `minecraft.Observer`はまだ実装しない。RCON endpointが現在のRuntime generationに属するという十分な証拠が無いため、process runningとMinecraft runningを同一視しない。Readinessは次の段階でgeneration-scopedな証拠の設計から行う。
 

@@ -46,21 +46,24 @@ var (
 )
 
 // Client is a minecraft.Control that sends commands over RCON. Each Command
-// opens a fresh connection, authenticates, writes the command packet, and
-// closes. Connections are intentionally not reused across CLI invocations.
+// opens a fresh connection, reads the password file, authenticates, writes the
+// command packet, and closes. Connections are intentionally not reused across
+// CLI invocations.
 type Client struct {
-	address  string
-	password string
+	address      string
+	passwordFile string
 }
 
 var _ minecraft.Control = (*Client)(nil)
 
-// New builds an RCON client. An empty address uses DefaultAddress.
-func New(address, password string) *Client {
+// New builds an RCON client. An empty address uses DefaultAddress. The password
+// file is read for each Command so missing or unreadable credentials do not
+// prevent status, state inspection, or process-only operations.
+func New(address, passwordFile string) *Client {
 	if address == "" {
 		address = DefaultAddress
 	}
-	return &Client{address: address, password: password}
+	return &Client{address: address, passwordFile: passwordFile}
 }
 
 // String and GoString keep the password out of accidental log formatting.
@@ -87,6 +90,10 @@ func (c *Client) Command(ctx context.Context, command string) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
+	password, err := LoadPassword(c.passwordFile)
+	if err != nil {
+		return fmt.Errorf("rcon credentials: %w", err)
+	}
 	dialer := net.Dialer{}
 	conn, err := dialer.DialContext(ctx, "tcp", c.address)
 	if err != nil {
@@ -108,7 +115,7 @@ func (c *Client) Command(ctx context.Context, command string) error {
 	stop := context.AfterFunc(ctx, func() { _ = conn.Close() })
 	defer stop()
 
-	if err := c.authenticate(conn); err != nil {
+	if err := authenticate(conn, password); err != nil {
 		return contextError(ctx, err)
 	}
 	if err := ctx.Err(); err != nil {
@@ -120,8 +127,8 @@ func (c *Client) Command(ctx context.Context, command string) error {
 	return nil
 }
 
-func (c *Client) authenticate(conn net.Conn) error {
-	if err := writePacket(conn, authRequestID, typeAuth, []byte(c.password)); err != nil {
+func authenticate(conn net.Conn, password string) error {
+	if err := writePacket(conn, authRequestID, typeAuth, []byte(password)); err != nil {
 		return fmt.Errorf("rcon write auth: %w", err)
 	}
 	// A few server implementations send an empty response before the auth
