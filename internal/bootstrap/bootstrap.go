@@ -2,7 +2,6 @@
 package bootstrap
 
 import (
-	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -70,7 +69,7 @@ func adoptFor(name string, directConfig *config.Direct) (*direct.Adopt, error) {
 	}
 	path := expandHome(directConfig.PidFile)
 	data, err := os.ReadFile(path)
-	if errors.Is(err, os.ErrNotExist) {
+	if hostlinux.IsGone(err) {
 		return nil, nil
 	}
 	if err != nil {
@@ -92,7 +91,7 @@ func adoptFor(name string, directConfig *config.Direct) (*direct.Adopt, error) {
 		}
 	} else {
 		stat, err := hostlinux.Read(pid)
-		if errors.Is(err, os.ErrNotExist) {
+		if hostlinux.IsGone(err) {
 			return nil, nil
 		}
 		if err != nil {

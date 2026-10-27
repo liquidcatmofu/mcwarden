@@ -3,9 +3,10 @@
 package linux
 
 import (
-	"errors"
+	"fmt"
 	"os"
 	"strings"
+	"syscall"
 	"testing"
 )
 
@@ -47,7 +48,26 @@ func TestReadSelf(t *testing.T) {
 }
 
 func TestReadMissingProcess(t *testing.T) {
-	if _, err := Read(1 << 30); !errors.Is(err, os.ErrNotExist) {
+	if _, err := Read(1 << 30); !IsGone(err) {
 		t.Fatalf("err=%v", err)
+	}
+}
+
+func TestIsGone(t *testing.T) {
+	for name, tt := range map[string]struct {
+		err  error
+		want bool
+	}{
+		"enoent":        {os.ErrNotExist, true},
+		"esrch":         {syscall.ESRCH, true},
+		"wrapped esrch": {fmt.Errorf("read stat: %w", syscall.ESRCH), true},
+		"other":         {syscall.EACCES, false},
+		"nil":           {nil, false},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if got := IsGone(tt.err); got != tt.want {
+				t.Fatalf("IsGone(%v)=%v want %v", tt.err, got, tt.want)
+			}
+		})
 	}
 }

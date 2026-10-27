@@ -22,7 +22,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"os"
 	"os/exec"
 	"sync"
 	"syscall"
@@ -136,13 +135,13 @@ func (p *process) gone() (bool, error) {
 }
 
 // adoptedAlive reports whether the adopted process still exists and still
-// matches the recorded start time. Only a missing process (ENOENT), a start
-// time mismatch, or a zombie/dead state counts as not alive; any other procfs
-// error is returned so the caller never mistakes an unreadable process for a
-// stopped one.
+// matches the recorded start time. Only a missing process (ENOENT/ESRCH), a
+// start time mismatch, or a zombie/dead state counts as not alive; any other
+// procfs error is returned so the caller never mistakes an unreadable process
+// for a stopped one.
 func (p *process) adoptedAlive() (bool, error) {
 	stat, err := procRead(p.pid)
-	if errors.Is(err, os.ErrNotExist) {
+	if hostlinux.IsGone(err) {
 		return false, nil
 	}
 	if err != nil {
@@ -173,7 +172,7 @@ func (r *Runtime) resolve() (*process, error) {
 		return nil, fmt.Errorf("adopt requires a start time: %w", ErrInvalid)
 	}
 	stat, err := procRead(r.cfg.Adopt.PID)
-	if errors.Is(err, os.ErrNotExist) {
+	if hostlinux.IsGone(err) {
 		return nil, nil
 	}
 	if err != nil {

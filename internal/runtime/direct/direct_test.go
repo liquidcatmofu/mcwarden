@@ -389,7 +389,7 @@ func waitGone(t *testing.T, pid int, timeout time.Duration) {
 	t.Helper()
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
-		if _, err := hostlinux.Read(pid); errors.Is(err, os.ErrNotExist) {
+		if _, err := hostlinux.Read(pid); hostlinux.IsGone(err) {
 			return
 		}
 		time.Sleep(20 * time.Millisecond)
