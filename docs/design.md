@@ -34,7 +34,7 @@ Runtimeの状態取得失敗はエラー。Minecraft側の取得失敗は部分�
 - 未知のTOMLキーはエラーにする。設定のtypoを黙って無視しないため。
 - `runtime`は`direct`（既定）と`podman`。`podman`は既知だが未実装として終了コード5を返す。
 - `direct.env`は親環境への追加として扱い、同名キーは設定側が上書きする。
-- `direct.pidfile`がある場合、内容の`PID`または`PID STARTTIME`から`Adopt`を作る。STARTTIME省略時はその場でprocfsを読み、その時点のstarttimeを固定する。pidfileやプロセスが無ければ「未起動」として採用しない。復元可能な内部stateがある場合はpidfileより優先する。
+- `direct.pidfile`がある場合、内容の`PID`または`PID STARTTIME`から`Adopt`を作る。STARTTIME省略時はその場でprocfsを読み、その時点のstarttimeを固定する。pidfileやプロセスが無ければ「未起動」として採用しない。`managed`な内部stateがある場合はpidfileより優先し、`stale`・`unknown`ではpidfileへfallbackしない。
 - 設定エラーは終了コード2。TOML読み込みに`github.com/BurntSushi/toml`を使う。
 
 ## process identity state
@@ -45,7 +45,8 @@ MCWardenが起動・採用した世代の同一性は`internal/state`が永続�
 - stateにはPID・PGID・starttime・boot_id・owned・signal_groupを保存する。boot_idが変われば再起動後の別プロセスとみなす。保存は同一ディレクトリの一時ファイル→fsync→renameで行う。
 - 分類は、liveかつPID/starttime/PGID/boot_idが一致すれば`managed`、PID消滅・starttime/PGID不一致・boot_id不一致・zombieなら`stale`、procfsやboot_idを読めなければ`unknown`。
 - `unknown`は停止済みとみなさず、自動削除も二重起動もしない。`stale`だけを`mcwarden state clean`で明示的に削除できる。`managed`と`unknown`のcleanは拒否する。
-- 次回のinvocationは`managed`（または`unknown`）の保存済みidentityから`direct.Adopt`を組み立て、新しい`DirectRuntime`へ復元する。`status`・`stop`・`restart`・signalが前回起動した世代を対象にできる。復元できるstateは`direct.pidfile`より優先する。
+- 次回のinvocationは`managed`の保存済みidentityだけから`direct.Adopt`を組み立て、新しい`DirectRuntime`へ復元する。`status`・`stop`・`restart`・signalが前回起動した世代を対象にできる。復元できるstateは`direct.pidfile`より優先する。
+- `unknown`はrecordを保持して`state show`と`status`（`unknown`）だけを許し、`start`・`stop`・`restart`・signalは`ErrStateUnknown`で拒否する。boot_idを検証できない以上、同じbootのプロセスと確定していないためsignalしない。`stale`は`state clean`待ちとし、`absent`だけがpidfile discoveryへ進む。
 - `start`前（`Restart`の起動段階を含む）はserver単位のflockを保持したままstateを検証し、`managed`・`unknown`・`stale`では起動しない。stateが無い場合もruntimeの状態を確認し、adopt済みプロセスの二重起動を防ぐ。
 - 起動後は`runtime.Identifiable`からidentityを取得して保存する。保存できなければ、追跡不能なプロセスを残さないよう起動したプロセスを停止し、残ったstateも掃除する。
 - `start`・`stop`・`restart`・`kill`・`state clean`はserver単位のflockで直列化する。`restart`はstop→wait/escalation→旧state削除→start→新state保存まで同じlockを保持する。内部helperはlockを取らない。

@@ -222,12 +222,15 @@ func (r *Runtime) resolve() (*process, error) {
 	return r.proc, nil
 }
 
-// Identity reports the generation this Runtime is tracking. It returns false
-// when there is no live generation or its start time could not be observed.
-// Reporting an identity never launches or adopts a process.
+// Identity reports the generation this Runtime is already tracking. It returns
+// false when there is no tracked generation or its start time could not be
+// observed. Reporting an identity never launches or adopts a process; call
+// State, Start, Signal, or Wait first to establish the generation.
 func (r *Runtime) Identity() (runtime.Identity, bool) {
-	p, err := r.resolve()
-	if err != nil || p == nil {
+	r.mu.Lock()
+	p := r.proc
+	r.mu.Unlock()
+	if p == nil {
 		return runtime.Identity{}, false
 	}
 	if p.done != nil {

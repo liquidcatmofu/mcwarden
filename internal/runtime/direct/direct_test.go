@@ -265,6 +265,9 @@ func TestAdoptOwnedGeneration(t *testing.T) {
 	rt := direct.New(direct.Config{Adopt: &direct.Adopt{
 		PID: stat.PID, PGID: stat.PGID, StartTime: stat.StartTime, Owned: true,
 	}})
+	if state, err := rt.State(ctx); err != nil || state != runtime.Running {
+		t.Fatalf("state=%s err=%v", state, err)
+	}
 
 	id, ok := rt.Identity()
 	if !ok {
@@ -272,9 +275,6 @@ func TestAdoptOwnedGeneration(t *testing.T) {
 	}
 	if !id.Owned || !id.SignalGroup || id.PID != stat.PID || id.PGID != stat.PGID || id.StartTime != stat.StartTime {
 		t.Fatalf("identity=%+v stat=%+v", id, stat)
-	}
-	if state, err := rt.State(ctx); err != nil || state != runtime.Running {
-		t.Fatalf("state=%s err=%v", state, err)
 	}
 	if err := rt.Start(ctx); !errors.Is(err, direct.ErrAlreadyRunning) {
 		t.Fatalf("start while rehydrated err=%v", err)
@@ -443,6 +443,26 @@ func TestIdentityReportsOwnedGeneration(t *testing.T) {
 	}
 }
 
+// TestIdentityDoesNotAdopt verifies that reporting identity is not a side
+// effect that establishes a generation.
+func TestIdentityDoesNotAdopt(t *testing.T) {
+	pid, stop := startExternal(t, "sleep", "")
+	defer stop()
+	stat := readStat(t, pid)
+	rt := direct.New(direct.Config{Adopt: &direct.Adopt{PID: stat.PID, StartTime: stat.StartTime}})
+
+	if _, ok := rt.Identity(); ok {
+		t.Fatal("identity reported before the generation was observed")
+	}
+	if state, err := rt.State(context.Background()); err != nil || state != runtime.Running {
+		t.Fatalf("state=%s err=%v", state, err)
+	}
+	id, ok := rt.Identity()
+	if !ok || id.PID != stat.PID {
+		t.Fatalf("identity=%+v ok=%v", id, ok)
+	}
+}
+
 // TestIdentityReportsAdoptedGeneration verifies that an adopted process keeps
 // the identity read from procfs.
 func TestIdentityReportsAdoptedGeneration(t *testing.T) {
@@ -450,6 +470,9 @@ func TestIdentityReportsAdoptedGeneration(t *testing.T) {
 	defer stop()
 	stat := readStat(t, pid)
 	rt := direct.New(direct.Config{Adopt: &direct.Adopt{PID: stat.PID, StartTime: stat.StartTime}})
+	if _, err := rt.State(context.Background()); err != nil {
+		t.Fatalf("state: %v", err)
+	}
 
 	id, ok := rt.Identity()
 	if !ok {

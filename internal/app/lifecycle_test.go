@@ -151,7 +151,7 @@ func TestPreflightNoSideEffects(t *testing.T) {
 		want error
 	}{
 		{"stopped", fake{state: runtime.Stopped}, StopOptions{time.Second}, ErrNotRunning},
-		{"unknown", fake{state: runtime.Unknown}, StopOptions{time.Second}, nil},
+		{"unknown", fake{state: runtime.Unknown}, StopOptions{time.Second}, ErrStateUnknown},
 		{"unsupported", fake{state: runtime.Running, noCommand: true}, StopOptions{time.Second}, ErrUnsupported},
 		{"invalid timeout", fake{state: runtime.Running}, StopOptions{}, ErrInvalid},
 	} {

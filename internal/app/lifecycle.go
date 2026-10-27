@@ -86,13 +86,16 @@ func (s Service) requireRunning(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("runtime state: %w", err)
 	}
-	if state == runtime.Stopped {
+	switch state {
+	case runtime.Running:
+		return nil
+	case runtime.Stopped:
 		return ErrNotRunning
-	}
-	if state != runtime.Running {
+	case runtime.Unknown:
+		return fmt.Errorf("%w: runtime state is unknown", ErrStateUnknown)
+	default:
 		return fmt.Errorf("runtime state is %q", state)
 	}
-	return nil
 }
 
 func (s Service) graceful(ctx context.Context, m *mutation, timeout time.Duration, result *Result) error {
