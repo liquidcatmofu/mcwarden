@@ -86,6 +86,115 @@ func TestLoadRejectsInvalid(t *testing.T) {
 	}
 }
 
+func TestLoadMinecraftRCON(t *testing.T) {
+	path := writeConfig(t, `
+[servers.rail.direct]
+command = "/bin/true"
+
+[servers.rail.minecraft]
+control = "rcon"
+
+[servers.rail.minecraft.rcon]
+address = "127.0.0.1:25575"
+password_file = "/run/mcwarden/rcon-password"
+`)
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	server := cfg.Servers["rail"]
+	if server.Minecraft == nil || server.Minecraft.Control != "rcon" || server.Minecraft.RCON == nil {
+		t.Fatalf("minecraft=%+v", server.Minecraft)
+	}
+	if got := server.Minecraft.RCON.Address; got != "127.0.0.1:25575" {
+		t.Fatalf("address=%q", got)
+	}
+	if got := server.Minecraft.RCON.PasswordFile; got != "/run/mcwarden/rcon-password" {
+		t.Fatalf("password_file=%q", got)
+	}
+}
+
+func TestLoadMinecraftRCONDefaultAddress(t *testing.T) {
+	path := writeConfig(t, `
+[servers.rail.direct]
+command = "/bin/true"
+
+[servers.rail.minecraft]
+control = "rcon"
+
+[servers.rail.minecraft.rcon]
+password_file = "/run/mcwarden/rcon-password"
+`)
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if got := cfg.Servers["rail"].Minecraft.RCON.Address; got != "" {
+		t.Fatalf("address should be left empty for the adapter default, got %q", got)
+	}
+}
+
+func TestLoadWithoutMinecraftControl(t *testing.T) {
+	path := writeConfig(t, `
+[servers.rail.direct]
+command = "/bin/true"
+`)
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if cfg.Servers["rail"].Minecraft != nil {
+		t.Fatalf("minecraft=%+v", cfg.Servers["rail"].Minecraft)
+	}
+}
+
+func TestLoadRejectsInvalidMinecraft(t *testing.T) {
+	for name, content := range map[string]string{
+		"missing rcon table": `
+[servers.rail.direct]
+command = "/bin/true"
+[servers.rail.minecraft]
+control = "rcon"
+`,
+		"missing password file": `
+[servers.rail.direct]
+command = "/bin/true"
+[servers.rail.minecraft]
+control = "rcon"
+[servers.rail.minecraft.rcon]
+address = "127.0.0.1:25575"
+`,
+		"unknown control": `
+[servers.rail.direct]
+command = "/bin/true"
+[servers.rail.minecraft]
+control = "console"
+`,
+		"missing control": `
+[servers.rail.direct]
+command = "/bin/true"
+[servers.rail.minecraft.rcon]
+password_file = "/run/secret"
+`,
+		"unknown rcon key": `
+[servers.rail.direct]
+command = "/bin/true"
+[servers.rail.minecraft]
+control = "rcon"
+[servers.rail.minecraft.rcon]
+password_file = "/run/secret"
+passwrod = "typo"
+`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			path := writeConfig(t, content)
+			if _, err := Load(path); !errors.Is(err, ErrInvalid) {
+				t.Fatalf("err=%v", err)
+			}
+		})
+	}
+}
+
 func TestLoadMissingFile(t *testing.T) {
 	if _, err := Load(filepath.Join(t.TempDir(), "absent.toml")); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("err=%v", err)

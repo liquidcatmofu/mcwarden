@@ -12,14 +12,16 @@ import (
 	"github.com/liquidcatmofu/mcwarden/internal/app"
 	"github.com/liquidcatmofu/mcwarden/internal/config"
 	hostlinux "github.com/liquidcatmofu/mcwarden/internal/host/linux"
+	"github.com/liquidcatmofu/mcwarden/internal/minecraft"
+	"github.com/liquidcatmofu/mcwarden/internal/minecraft/rcon"
 	"github.com/liquidcatmofu/mcwarden/internal/runtime"
 	"github.com/liquidcatmofu/mcwarden/internal/runtime/direct"
 	"github.com/liquidcatmofu/mcwarden/internal/state"
 )
 
 // Service loads configPath (or the default path), selects serverName, and
-// builds an app service. Only the runtime is wired; Minecraft control is added
-// with the console/agent adapter.
+// builds an app service. The runtime owns process lifecycle; an optional
+// Minecraft control transport is wired separately.
 func Service(configPath, serverName string) (app.Service, error) {
 	cfg, err := config.Load(configPath)
 	if err != nil {
@@ -41,11 +43,39 @@ func Service(configPath, serverName string) (app.Service, error) {
 	if err != nil {
 		return app.Service{}, err
 	}
+	control, err := minecraftControlFor(name, server)
+	if err != nil {
+		return app.Service{}, err
+	}
 	return app.Service{
 		Runtime:     rt,
+		Minecraft:   control,
 		RuntimeName: "direct",
 		StateStore:  func() (*state.Store, error) { return store, nil },
 	}, nil
+}
+
+// minecraftControlFor builds the configured command transport. A missing
+// [servers.<name>.minecraft] table leaves control unsupported; configuration
+// validation rejects a control name without its required settings.
+func minecraftControlFor(name string, server config.Server) (minecraft.Control, error) {
+	if server.Minecraft == nil {
+		return nil, nil
+	}
+	switch server.Minecraft.Control {
+	case "rcon":
+		settings := server.Minecraft.RCON
+		if settings == nil {
+			return nil, configError(fmt.Errorf("server %q: missing minecraft.rcon config", name))
+		}
+		password, err := rcon.LoadPassword(expandHome(settings.PasswordFile))
+		if err != nil {
+			return nil, configError(fmt.Errorf("server %q: %w", name, err))
+		}
+		return rcon.New(settings.Address, password), nil
+	default:
+		return nil, configError(fmt.Errorf("server %q: unknown minecraft control %q", name, server.Minecraft.Control))
+	}
 }
 
 // runtimeFor builds the runtime appropriate for the persisted state:

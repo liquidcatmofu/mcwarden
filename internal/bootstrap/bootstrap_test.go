@@ -15,6 +15,8 @@ import (
 	"github.com/liquidcatmofu/mcwarden/internal/app"
 	"github.com/liquidcatmofu/mcwarden/internal/config"
 	hostlinux "github.com/liquidcatmofu/mcwarden/internal/host/linux"
+	"github.com/liquidcatmofu/mcwarden/internal/minecraft"
+	"github.com/liquidcatmofu/mcwarden/internal/minecraft/rcon"
 	"github.com/liquidcatmofu/mcwarden/internal/runtime"
 	"github.com/liquidcatmofu/mcwarden/internal/state"
 )
@@ -63,6 +65,81 @@ env = ["MC_TEST=1"]
 `)
 	if state := statusOf(t, path, ""); state != runtime.Stopped {
 		t.Fatalf("state=%s", state)
+	}
+}
+
+func TestServiceWiresRCONControl(t *testing.T) {
+	passwordFile := filepath.Join(t.TempDir(), "rcon-password")
+	if err := os.WriteFile(passwordFile, []byte("secret\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	path := writeConfig(t, fmt.Sprintf(`
+[servers.rail.direct]
+command = "/bin/true"
+
+[servers.rail.minecraft]
+control = "rcon"
+
+[servers.rail.minecraft.rcon]
+password_file = %q
+`, passwordFile))
+	service, err := Service(path, "")
+	if err != nil {
+		t.Fatalf("bootstrap: %v", err)
+	}
+	if service.Minecraft == nil {
+		t.Fatal("minecraft control was not wired")
+	}
+	if _, ok := service.Minecraft.(*rcon.Client); !ok {
+		t.Fatalf("minecraft control=%T, want *rcon.Client", service.Minecraft)
+	}
+	caps, err := service.Minecraft.Capabilities(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if caps != (minecraft.Capabilities{Command: true, Readiness: false}) {
+		t.Fatalf("capabilities=%+v", caps)
+	}
+}
+
+func TestServiceWithoutMinecraftControl(t *testing.T) {
+	path := writeConfig(t, "[servers.rail.direct]\ncommand = \"/bin/true\"\n")
+	service, err := Service(path, "")
+	if err != nil {
+		t.Fatalf("bootstrap: %v", err)
+	}
+	if service.Minecraft != nil {
+		t.Fatalf("minecraft control=%T, want nil", service.Minecraft)
+	}
+}
+
+func TestServiceRejectsInvalidRCONPassword(t *testing.T) {
+	for name, content := range map[string]string{
+		"empty":        "\n",
+		"empty crlf":   "\r\n",
+		"missing file": "",
+	} {
+		t.Run(name, func(t *testing.T) {
+			passwordFile := filepath.Join(t.TempDir(), "rcon-password")
+			if name != "missing file" {
+				if err := os.WriteFile(passwordFile, []byte(content), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			path := writeConfig(t, fmt.Sprintf(`
+[servers.rail.direct]
+command = "/bin/true"
+
+[servers.rail.minecraft]
+control = "rcon"
+
+[servers.rail.minecraft.rcon]
+password_file = %q
+`, passwordFile))
+			if _, err := Service(path, ""); !errors.Is(err, app.ErrConfig) {
+				t.Fatalf("err=%v want config error", err)
+			}
+		})
 	}
 }
 

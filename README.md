@@ -2,7 +2,9 @@
 
 Minecraftサーバーの運用・監視・診断を行う、Go製CLIの開発初期段階です。
 
-現在はRuntime / Minecraft Controlの境界、停止・再起動の制御、部分的なstatus取得、JSON出力とテストを実装しています。Linux向けの`DirectProcess`アダプター（`internal/runtime/direct`）とTOML設定・server selection、MCWarden管理下プロセスのidentity永続化を実装し、`status`・`start`・`state`はCLIから利用できます。Minecraft側のcontrol/readiness adapterはまだ無いため、`start`（既定）・`stop`・`restart`は終了コード5を返します。`start --no-wait`はプロセス起動後に返ります。`kill`のCLI配線はまだです。
+現在はRuntime / Minecraft Controlの境界、停止・再起動の制御、部分的なstatus取得、JSON出力とテストを実装しています。Linux向けの`DirectProcess`アダプター（`internal/runtime/direct`）とTOML設定・server selection、MCWarden管理下プロセスのidentity永続化、RCONによるMinecraft Control（`internal/minecraft/rcon`）を実装しています。`status`・`start --no-wait`・`stop`・`restart --no-wait`・`state`はCLIから利用できます。
+
+Readiness Observerはまだ実装していません。RCON接続はcommand transportであり、Minecraftの起動完了やhealthの証拠ではありません。そのため既定の`start`と`restart`はreadiness unsupportedで終了コード5を返します。`kill`のCLI配線もまだです。
 
 ```sh
 go test -race ./...
@@ -31,6 +33,13 @@ env = ["JAVA_HOME=/usr/lib/jvm/temurin-21"]
 # 既存プロセスを採用する場合（任意）。PID または "PID STARTTIME"。
 # pidfile = "/run/mcwarden/rail.pid"
 # signal_group = false
+
+[servers.rail.minecraft]
+control = "rcon"
+
+[servers.rail.minecraft.rcon]
+address = "127.0.0.1:25575" # 省略時もこの値
+password_file = "/srv/minecraft/secrets/rcon-password"
 ```
 
 `-s/--server`でサーバーを選びます。省略時は`default_server`、それが無ければ唯一のサーバーを使います。グローバルオプションはコマンドの前後どちらでも置けます。
@@ -39,6 +48,40 @@ env = ["JAVA_HOME=/usr/lib/jvm/temurin-21"]
 mcwarden -c ./config.toml -s rail status
 mcwarden status -s rail --json
 ```
+
+`[servers.<name>.minecraft]`が無い場合、Minecraft Controlはunsupportedのままです。`control = "rcon"`には`[servers.<name>.minecraft.rcon]`と`password_file`が必要です。未知のcontrol名や未知のTOMLキーは設定エラーになります。
+
+## RCON control
+
+RCONはMinecraftへのcommand transport専用です。Runtimeがプロセスのライフサイクルを所有し、RCONはコマンド送信だけを担当します。RCON adapterにRuntimeの所有権はありません。
+
+`mcwarden stop`はRCONで`stop`を送信したあと、`Runtime.Wait`でプロセス終了を待ちます。タイムアウトしても`stop`自身はSIGTERM/SIGKILLへescalateしません。通信失敗・認証失敗・呼び出し元のキャンセルもescalationの理由にしません。
+
+`mcwarden restart --no-wait`は次の順に進みます。
+
+```text
+RCON "stop"
+→ Runtime.Wait
+→ 旧世代のidentityをclean
+→ Runtime.Start
+→ 新世代のidentityを保存
+→ 戻る
+```
+
+`restart --term` / `--kill --force`の既存escalationルールはそのままです。escalationは待機タイムアウト時だけ行い、RCONの通信エラーでは行いません。
+
+RCONの`Command`は「配送を受け付けた」ことを成功とし、コマンドの効果完了までは待ちません。`stop`ではサーバーが応答前に終了し得るため、認証成功後にcommand packetを完全にwriteできた時点で成功とします。終了確認は`Runtime.Wait`が行います。RCON接続はCLI invocationを跨いで維持せず、各`Command`でdial → authenticate → command write → closeします。
+
+RCON接続成功をMinecraft lifecycleの`Running`証拠にはしません。`process running`と`Minecraft running`は別であり、現時点ではRCON endpointが現在のRuntime generationに属するという十分な証拠がありません。Readiness Observerは次の段階で、generation-scopedな証拠の設計から実装します。
+
+### password file
+
+RCON passwordはCLI引数やTOMLへ直接書かず、`password_file`から読みます。ファイルはMCWardenを実行するユーザーだけが読める権限にしてください。
+
+- 末尾の`\n`または`\r\n`だけを除去します。空白などそれ以外の文字はtrimしません。
+- 除去後に空になるpasswordは設定/bootstrapエラーです。
+- passwordそのものはerror、JSON output、log、テストの失敗メッセージへ出しません。
+- `server.properties`の自動解析は行いません。
 
 ## process identity state
 
@@ -61,6 +104,6 @@ server単位のflockは`start`・`stop`・`restart`・`kill`・`state clean`の�
 
 シグナル送信の直前にPID・starttime・PGIDを再検証し、不一致なら送信しません。group signalはPIDがそのgroup leaderである場合だけ行います。
 
-停止はMinecraftの`stop`だけを使用します。再起動時のシグナル送信は`--term`または`--kill --force`で明示した場合に限定し、停止確認後にだけ起動します。再起動はMinecraftの起動完了まで待ち、`--no-wait`ではプロセス起動後に返します。
+停止はMinecraftの`stop`だけを使用します。再起動時のシグナル送信は`--term`または`--kill --force`で明示した場合に限定し、停止確認後にだけ起動します。既定の`restart`はMinecraftの起動完了まで待つ設計ですが、Readiness Observerが未実装のため現在は終了コード5を返します。`--no-wait`ではRCONによるgraceful stop後にプロセスを起動して返します。
 
 [設計](docs/design.md) / [MIT License](LICENSE)
