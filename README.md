@@ -2,7 +2,7 @@
 
 Minecraftサーバーの運用・監視・診断を行う、Go製CLIの開発初期段階です。
 
-現在はRuntime / Minecraft Controlの境界、停止・再起動の制御、部分的なstatus取得、JSON出力とテストを実装しています。Linux向けの`DirectProcess`アダプター（`internal/runtime/direct`）とTOML設定・server selection、MCWarden管理下プロセスのidentity永続化、RCONによるMinecraft Control（`internal/minecraft/rcon`）を実装しています。`status`・`start --no-wait`・`stop`・`restart --no-wait`・`state`はCLIから利用できます。
+現在はRuntime / Minecraft Controlの境界、停止・再起動の制御、部分的なstatus取得、JSON出力とテストを実装しています。Linux向けの`DirectProcess`アダプター（`internal/runtime/direct`）、Quadlet-backed Podmanアダプター（`internal/runtime/podman`）とTOML設定・server selection、Direct管理下プロセスのidentity永続化、RCONによるMinecraft Control（`internal/minecraft/rcon`）を実装しています。`status`・`start --no-wait`・`stop`・`restart --no-wait`はCLIから利用できます。`state`はDirect専用です。
 
 Readiness Observerはまだ実装していません。RCON接続はcommand transportであり、Minecraftの起動完了やhealthの証拠ではありません。そのため既定の`start`と`restart`はreadiness unsupportedで終了コード5を返します。`kill`のCLI配線もまだです。
 
@@ -51,6 +51,63 @@ mcwarden status -s rail --json
 
 `[servers.<name>.minecraft]`が無い場合、Minecraft Controlはunsupportedのままです。`control = "rcon"`には`[servers.<name>.minecraft.rcon]`と`password_file`が必要です。未知のcontrol名や未知のTOMLキーは設定エラーになります。
 
+## Quadlet-backed Podman Runtime
+
+対象は **rootless Podman + Quadlet + user systemd** です。同じユーザーのhost上で`systemctl --user`と`podman` CLIを使用します。Podman socket/APIやDBusへ直接接続せず、MCWardenはQuadletファイルの生成・編集、image build/pull/updateも行いません。事前にQuadletとuser unitを構成してください。
+
+```toml
+default_server = "rail"
+
+[servers.rail]
+runtime = "podman"
+
+[servers.rail.podman]
+unit = "minecraft-rail.service"
+container = "minecraft-rail"
+
+[servers.rail.minecraft]
+control = "rcon"
+
+[servers.rail.minecraft.rcon]
+address = "127.0.0.1:25575"
+password_file = "~/.config/mcwarden/secrets/rail-rcon-password"
+```
+
+`podman` table、`unit`（`.service`名）、`container`は必須です。`direct`設定は使用しません。責務は次のように分離します。
+
+| 責務 | authority |
+| --- | --- |
+| Start / escalation coordination | systemd user unit |
+| generation observation / wait | Podmanのfull container ID |
+| Minecraft graceful stop | 既存RCON |
+
+`start --no-wait`は`systemctl --user start`後、running containerのIDをpinして返します。Minecraft readinessの成功ではありません。`status`はRuntimeのlivenessのみを確認し、health/TPSやMinecraft起動完了は判定しません。主な動作対象は`start --no-wait`・`stop`・`restart --no-wait`・`status`です。Readiness Observerは今回も未実装のため、通常の`start` / `restart`は引き続きunsupported（終了コード5）です。
+
+初回の`State`はcontainer名からrunning containerを発見したあと、configured Quadlet unitのownershipとcontainerのcgroupを検証してからfull IDをpinします。検証できなければUnknown/errorを返し、pinもRCON stopも行いません。これによりfresh invocationの`status`・`stop`・`restart`も設定不一致をfail-closedで拒否します。
+
+一度pinしたRuntime instanceは、同名containerが再作成されてもreplacementへ自動追従しません。旧IDの終了を待ち、明示的な`Start`成功時だけ次世代をpinします。新しいCLI invocationはownership検証を経て名前から現在の世代を発見できます。Quadletによるauto-removeでWait開始前に旧containerが削除されていた場合、終了確認は成功、exit statusは`Known=false`となります。137等のexit codeからsignalを推測しません。containerが無いのにunitがactive/activating等の場合や、paused/stopping等は安全に停止済みと判断できないためUnknown/errorです。
+
+通常の`stop`はRCON `stop` → 旧IDのWaitです。Minecraftの正常終了（code 0）はunitの`Restart=on-failure`では再起動しない前提です。`restart --no-wait`はその後systemdで起動し、新IDをpinします。
+
+**PodmanのTERM-only escalationはunsupported（exit 5）です。** Quadletのstop jobはMCWardenの待機タイムアウト後も継続し、`StopTimeout`等で暗黙に強制停止する可能性があるため、`--term`だけではstop jobもPodman signalも発行しません。RCON stop後の待機がタイムアウトしてTERM escalationが必要になった場合にunsupportedで終了します。unit設定の書き換えやrestart policyの一時変更も行いません。
+
+`restart --no-wait --kill --force`で強制停止を明示許可した場合だけ、graceful wait timeout後にPodmanのunsupportedなTERM stageをskipし、次の順で処理します。
+
+```text
+systemctl --user stop --no-block <verified-unit>
+→ podman kill --signal KILL <pinned-ID>
+→ Runtime.Wait（同じID）
+→ Runtime.Start
+```
+
+先にstop jobを入れてsystemdの`Restart=on-failure`によるreplacement起動を抑止します。generic lifecycleでskipできるのは`Signal(Terminate)`の`ErrUnsupported`だけです。他のTERMエラー、Waitのunsupported、RCON失敗や親contextのキャンセルからKILLへ進むことはありません。Directは従来どおりTERM → TERM待機timeout → KILLです。
+
+初回のrunning generation発見時とStart/Killの前に、`systemctl --user show`でloaded/generatedな`.container`由来のunitであること、canonical unit名、生成fragmentが現在のロード内容と一致することを検証します。生成fragmentの`ExecStart`が設定container名を指定する直接の`podman run --name ...`でなければpinもmutationも拒否します。初回pin前・KILL前・Start後には、Podman inspectの`State.CgroupPath`がunitの`ControlGroup`配下であることも確認します。名前や任意のlabelだけをownershipの証拠にしません。
+
+現在のownership検証は安全側に制限しています。systemdのservice drop-in、daemon-reload待ち、global arguments/wrapper付きExecStart、検証できないquote/継続行/環境変数展開等はunsupportedです。Quadletソース側の設定は生成fragmentへ反映してください。実行中containerがunitのdelegated cgroup配下にならない構成（例：`CgroupsMode`の変更）も検証できなければ拒否します。既知のreplacementは停止しませんが、unit/fragment/name/cgroup確認とmutationは原子的ではなく、外部操作との同時変更までは保証できません。
+
+Podmanはhost PIDをidentityとして公開・保存せず、Direct用PID/PGID/starttime/boot_id stateを読みません。container identityの永続化も今回は行いません。`state show` / `state clean`はunsupportedです。一方、lifecycle mutationはDirectと同じserver単位のflockを取得します。
+
 ## RCON control
 
 RCONはMinecraftへのcommand transport専用です。Runtimeがプロセスのライフサイクルを所有し、RCONはコマンド送信だけを担当します。RCON adapterにRuntimeの所有権はありません。
@@ -64,13 +121,13 @@ RCONはplaintext transportです。loopback、または信頼できる暗号化�
 ```text
 RCON "stop"
 → Runtime.Wait
-→ 旧世代のidentityをclean
+→ 旧世代のidentityをclean（Directのみ）
 → Runtime.Start
-→ 新世代のidentityを保存
+→ 新世代のidentityを保存（Directのみ。PodmanはIDをinstance内でpin）
 → 戻る
 ```
 
-`restart --term` / `--kill --force`の既存escalationルールはそのままです。escalationは待機タイムアウト時だけ行い、RCONの通信エラーでは行いません。
+escalationは待機タイムアウト時だけ行い、RCONの通信エラーでは行いません。Directの`restart --term` / `--kill --force`の既存挙動は維持します。PodmanのTERM-onlyは上記のとおりunsupportedです。
 
 RCONの`Command`は「配送を受け付けた」ことを成功とし、コマンドの効果完了までは待ちません。`stop`ではサーバーが応答前に終了し得るため、認証成功後にcommand packetを完全にwriteできた時点で成功とします。終了確認は`Runtime.Wait`が行います。RCON接続はCLI invocationを跨いで維持せず、各`Command`でdial → authenticate → command write → closeします。
 
@@ -86,7 +143,7 @@ RCON passwordはCLI引数やTOMLへ直接書かず、`password_file`から読み
 - passwordそのものはerror、JSON output、log、テストの失敗メッセージへ出しません。
 - `server.properties`の自動解析は行いません。
 
-## process identity state
+## process identity state（Direct専用）
 
 ```sh
 mcwarden -s rail start --no-wait     # プロセス起動後に返る

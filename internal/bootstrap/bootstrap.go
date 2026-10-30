@@ -16,6 +16,7 @@ import (
 	"github.com/liquidcatmofu/mcwarden/internal/minecraft/rcon"
 	"github.com/liquidcatmofu/mcwarden/internal/runtime"
 	"github.com/liquidcatmofu/mcwarden/internal/runtime/direct"
+	"github.com/liquidcatmofu/mcwarden/internal/runtime/podman"
 	"github.com/liquidcatmofu/mcwarden/internal/state"
 )
 
@@ -31,13 +32,17 @@ func Service(configPath, serverName string) (app.Service, error) {
 	if err != nil {
 		return app.Service{}, configError(err)
 	}
-	store, err := state.Open(name)
-	if err != nil {
-		return app.Service{}, fmt.Errorf("server %q: %w", name, err)
-	}
-	inspection, err := store.Inspect()
-	if err != nil {
-		return app.Service{}, fmt.Errorf("server %q: state: %w", name, err)
+	var store *state.Store
+	var inspection state.Inspection
+	if server.Runtime != "podman" {
+		store, err = state.Open(name)
+		if err != nil {
+			return app.Service{}, fmt.Errorf("server %q: %w", name, err)
+		}
+		inspection, err = store.Inspect()
+		if err != nil {
+			return app.Service{}, fmt.Errorf("server %q: state: %w", name, err)
+		}
 	}
 	rt, err := runtimeFor(name, server, inspection)
 	if err != nil {
@@ -47,12 +52,18 @@ func Service(configPath, serverName string) (app.Service, error) {
 	if err != nil {
 		return app.Service{}, err
 	}
-	return app.Service{
-		Runtime:     rt,
-		Minecraft:   control,
-		RuntimeName: "direct",
-		StateStore:  func() (*state.Store, error) { return store, nil },
-	}, nil
+	service := app.Service{
+		Runtime:       rt,
+		Minecraft:     control,
+		RuntimeName:   "direct",
+		OperationLock: func() (*state.Lock, error) { return state.LockServer(name) },
+	}
+	if server.Runtime == "podman" {
+		service.RuntimeName = "podman"
+	} else {
+		service.StateStore = func() (*state.Store, error) { return store, nil }
+	}
+	return service, nil
 }
 
 // minecraftControlFor builds the configured command transport. A missing
@@ -88,7 +99,10 @@ func runtimeFor(name string, server config.Server, inspection state.Inspection) 
 	switch server.Runtime {
 	case "", "direct":
 	case "podman":
-		return nil, fmt.Errorf("server %q: runtime podman is not implemented: %w", name, app.ErrUnsupported)
+		if server.Podman == nil {
+			return nil, configError(fmt.Errorf("server %q: missing podman config", name))
+		}
+		return podman.New(podman.Config{Unit: server.Podman.Unit, Container: server.Podman.Container}), nil
 	default:
 		return nil, configError(fmt.Errorf("server %q: unknown runtime %q", name, server.Runtime))
 	}

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strings"
 
@@ -34,8 +35,18 @@ type Server struct {
 	// Runtime is "direct" or "podman". Empty means "direct".
 	Runtime   string     `toml:"runtime"`
 	Direct    *Direct    `toml:"direct"`
+	Podman    *Podman    `toml:"podman"`
 	Minecraft *Minecraft `toml:"minecraft"`
 }
+
+// Podman selects an existing Quadlet-generated user service and container.
+type Podman struct {
+	Unit      string `toml:"unit"`
+	Container string `toml:"container"`
+}
+
+var unitName = regexp.MustCompile(`^[a-zA-Z0-9_][a-zA-Z0-9_.@:\\-]*\.service$`)
+var containerName = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9_.-]*$`)
 
 // Minecraft describes how MCWarden sends commands to Minecraft. It is separate
 // from the runtime because process liveness does not imply Minecraft readiness.
@@ -139,7 +150,15 @@ func (c Config) validate() error {
 				return fmt.Errorf("server %q needs direct.command or direct.pidfile", name)
 			}
 		case "podman":
-			// Accepted as a known future runtime; the adapter is not implemented.
+			if server.Podman == nil {
+				return fmt.Errorf("server %q needs a [servers.%s.podman] table", name, name)
+			}
+			if !unitName.MatchString(server.Podman.Unit) {
+				return fmt.Errorf("server %q needs a valid podman.unit service name", name)
+			}
+			if !containerName.MatchString(server.Podman.Container) {
+				return fmt.Errorf("server %q needs a valid podman.container name", name)
+			}
 		default:
 			return fmt.Errorf("server %q has unknown runtime %q", name, server.Runtime)
 		}

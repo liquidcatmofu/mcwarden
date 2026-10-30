@@ -68,6 +68,37 @@ commnd_typo = "x"
 	}
 }
 
+func TestPodman(t *testing.T) {
+	const prefix = "[servers.rail]\nruntime = \"podman\"\n"
+	for _, tt := range []struct {
+		name, body string
+		valid      bool
+	}{
+		{"valid", "[servers.rail.podman]\nunit = 'minecraft-rail.service'\ncontainer = 'minecraft-rail'\n", true},
+		{"missing table", "", false},
+		{"missing unit", "[servers.rail.podman]\ncontainer = 'minecraft-rail'\n", false},
+		{"missing container", "[servers.rail.podman]\nunit = 'minecraft-rail.service'\n", false},
+		{"unknown key", "[servers.rail.podman]\nunit = 'minecraft-rail.service'\ncontainer = 'minecraft-rail'\ncontaner = 'typo'\n", false},
+		{"option unit", "[servers.rail.podman]\nunit = '--all.service'\ncontainer = 'minecraft-rail'\n", false},
+		{"path unit", "[servers.rail.podman]\nunit = '../rail.service'\ncontainer = 'minecraft-rail'\n", false},
+		{"wrong unit type", "[servers.rail.podman]\nunit = 'rail.socket'\ncontainer = 'minecraft-rail'\n", false},
+		{"option container", "[servers.rail.podman]\nunit = 'rail.service'\ncontainer = '--all'\n", false},
+		{"shell characters", "[servers.rail.podman]\nunit = 'rail.service'\ncontainer = 'rail;echo x'\n", false},
+		{"ignore direct settings", "[servers.rail.podman]\nunit = 'rail.service'\ncontainer = 'rail'\n[servers.rail.direct]\npidfile = '/nonexistent'\n", true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg, err := Load(writeConfig(t, prefix+tt.body))
+			if tt.valid {
+				if err != nil || cfg.Servers["rail"].Podman == nil {
+					t.Fatalf("%+v %v", cfg, err)
+				}
+			} else if !errors.Is(err, ErrInvalid) {
+				t.Fatalf("err=%v", err)
+			}
+		})
+	}
+}
+
 func TestLoadRejectsInvalid(t *testing.T) {
 	for name, content := range map[string]string{
 		"no servers":      ``,

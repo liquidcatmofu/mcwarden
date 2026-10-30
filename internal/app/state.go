@@ -27,10 +27,24 @@ type mutation struct {
 	lock  *state.Lock
 }
 
-// beginMutation acquires the server lock. Without a state store there is
-// nothing to lock or persist, so operations still work for runtimes without a
-// host process, such as tests and in-process embeddings.
+// beginMutation acquires the operation lock independently of process state.
+// StateStore-only embeddings retain the historical store lock fallback.
 func (s Service) beginMutation() (*mutation, error) {
+	if s.OperationLock != nil {
+		lock, err := s.OperationLock()
+		if err != nil {
+			return nil, fmt.Errorf("operation lock: %w", err)
+		}
+		m := &mutation{lock: lock}
+		if s.StateStore != nil {
+			m.store, err = s.StateStore()
+			if err != nil {
+				m.release()
+				return nil, fmt.Errorf("state: %w", err)
+			}
+		}
+		return m, nil
+	}
 	if s.StateStore == nil {
 		return &mutation{}, nil
 	}

@@ -21,6 +21,8 @@ type fake struct {
 	state                                              runtime.State
 	waits                                              []error
 	capsErr, commandErr, signalErr, startErr, stateErr error
+	termSignalErr                                      error
+	termCancel                                         context.CancelFunc
 	noCommand                                          bool
 	cancel                                             context.CancelFunc
 }
@@ -32,7 +34,57 @@ func (f *fake) State(context.Context) (runtime.State, error) {
 func (f *fake) Start(context.Context) error { f.calls = append(f.calls, "start"); return f.startErr }
 func (f *fake) Signal(_ context.Context, sig runtime.Signal) error {
 	f.calls = append(f.calls, string(sig))
+	if sig == runtime.Terminate && f.termCancel != nil {
+		f.termCancel()
+	}
+	if sig == runtime.Terminate && f.termSignalErr != nil {
+		return f.termSignalErr
+	}
 	return f.signalErr
+}
+
+func TestRestartCanceledUnsupportedTermDoesNotKill(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	f := &fake{state: runtime.Running, waits: []error{context.DeadlineExceeded}, termSignalErr: ErrUnsupported, termCancel: cancel}
+	_, err := (Service{Runtime: f, Minecraft: f}).Restart(ctx, RestartOptions{NoWait: true, StopTimeout: time.Millisecond, TermTimeout: time.Millisecond, KillTimeout: time.Millisecond, Escalation: WithKill, AllowSIGKILL: true})
+	if !errors.Is(err, context.Canceled) || !reflect.DeepEqual(f.calls, []string{"state", "stop", "wait", "term"}) {
+		t.Fatalf("error=%v calls=%v", err, f.calls)
+	}
+}
+
+func TestRestartUnsupportedTerminate(t *testing.T) {
+	for _, tt := range []struct {
+		name    string
+		level   Escalation
+		termErr error
+		waits   []error
+		want    error
+		calls   []string
+	}{
+		{"term unsupported", WithTerm, ErrUnsupported, []error{context.DeadlineExceeded}, ErrUnsupported, []string{"state", "stop", "wait", "term"}},
+		{"kill skips unsupported term", WithKill, fmt.Errorf("TERM-only: %w", ErrUnsupported), []error{context.DeadlineExceeded, nil}, nil, []string{"state", "stop", "wait", "term", "kill", "wait", "start"}},
+		{"external term failure", WithKill, ErrExternal, []error{context.DeadlineExceeded}, ErrExternal, []string{"state", "stop", "wait", "term"}},
+		{"term cancellation", WithKill, context.Canceled, []error{context.DeadlineExceeded}, context.Canceled, []string{"state", "stop", "wait", "term"}},
+		{"term deadline", WithKill, context.DeadlineExceeded, []error{context.DeadlineExceeded}, context.DeadlineExceeded, []string{"state", "stop", "wait", "term"}},
+		{"unsupported graceful wait", WithKill, nil, []error{ErrUnsupported}, ErrUnsupported, []string{"state", "stop", "wait"}},
+		{"unsupported term wait", WithKill, nil, []error{context.DeadlineExceeded, ErrUnsupported}, ErrUnsupported, []string{"state", "stop", "wait", "term", "wait"}},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			f := &fake{state: runtime.Running, waits: tt.waits, termSignalErr: tt.termErr}
+			result, err := (Service{Runtime: f, Minecraft: f}).Restart(context.Background(), RestartOptions{NoWait: true, StopTimeout: time.Millisecond, TermTimeout: time.Millisecond, KillTimeout: time.Millisecond, Escalation: tt.level, AllowSIGKILL: true})
+			if !errors.Is(err, tt.want) || !reflect.DeepEqual(f.calls, tt.calls) {
+				t.Fatalf("error=%v calls=%v want %v %v", err, f.calls, tt.want, tt.calls)
+			}
+			if tt.termErr != nil {
+				for _, event := range result.Events {
+					if event == TermSent || event == TermTimedOut {
+						t.Fatalf("unsupported/failed TERM must not produce TERM events: %v", result.Events)
+					}
+				}
+			}
+		})
+	}
 }
 func (f *fake) Command(_ context.Context, command string) error {
 	f.calls = append(f.calls, command)
