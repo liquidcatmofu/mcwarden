@@ -85,7 +85,24 @@ password_file = "~/.config/mcwarden/secrets/rail-rcon-password"
 
 一度pinしたRuntime instanceは、同名containerが再作成されてもreplacementへ自動追従しません。旧IDの終了を待ち、明示的な`Start`成功時だけ次世代をpinします。新しいCLI invocationは名前から現在の世代を発見できます。Quadletによるauto-removeでWait開始前に旧containerが削除されていた場合、終了確認は成功、exit statusは`Known=false`となります。137等のexit codeからsignalを推測しません。containerが無いのにunitがactive/activating等の場合や、paused/stopping等は安全に停止済みと判断できないためUnknown/errorです。
 
-通常の`stop`はRCON `stop` → 旧IDのWaitです。Minecraftの正常終了（code 0）はunitの`Restart=on-failure`では再起動しない前提です。`restart --no-wait`はその後systemdで起動し、新IDをpinします。`--term`によるescalationは`systemctl --user stop --no-block`でQuadletのExecStopへ委譲します。`--kill --force`も先にそのstop jobを入れてsystemdのrestart policyを抑止し、その後**pin済みIDだけ**へ`podman kill --signal KILL`を送ります。RCON失敗ではescalateしません。既知のreplacementは停止しませんが、unit/name確認とstop job投入は別CLI呼び出しであり、外部操作との原子的な同期は保証できません。
+通常の`stop`はRCON `stop` → 旧IDのWaitです。Minecraftの正常終了（code 0）はunitの`Restart=on-failure`では再起動しない前提です。`restart --no-wait`はその後systemdで起動し、新IDをpinします。
+
+**PodmanのTERM-only escalationはunsupported（exit 5）です。** Quadletのstop jobはMCWardenの待機タイムアウト後も継続し、`StopTimeout`等で暗黙に強制停止する可能性があるため、`--term`だけではstop jobもPodman signalも発行しません。RCON stop後の待機がタイムアウトしてTERM escalationが必要になった場合にunsupportedで終了します。unit設定の書き換えやrestart policyの一時変更も行いません。
+
+`restart --no-wait --kill --force`で強制停止を明示許可した場合だけ、graceful wait timeout後にPodmanのunsupportedなTERM stageをskipし、次の順で処理します。
+
+```text
+systemctl --user stop --no-block <verified-unit>
+→ podman kill --signal KILL <pinned-ID>
+→ Runtime.Wait（同じID）
+→ Runtime.Start
+```
+
+先にstop jobを入れてsystemdの`Restart=on-failure`によるreplacement起動を抑止します。generic lifecycleでskipできるのは`Signal(Terminate)`の`ErrUnsupported`だけです。他のTERMエラー、Waitのunsupported、RCON失敗や親contextのキャンセルからKILLへ進むことはありません。Directは従来どおりTERM → TERM待機timeout → KILLです。
+
+Start/Killの前に、`systemctl --user show`でloaded/generatedな`.container`由来のunitであること、canonical unit名、生成fragmentが現在のロード内容と一致することを検証します。生成fragmentの`ExecStart`が設定container名を指定する直接の`podman run --name ...`でなければmutationを拒否します。KILL前とStart後には、Podman inspectの`State.CgroupPath`がunitの`ControlGroup`配下であることも確認します。名前や任意のlabelだけをownershipの証拠にしません。
+
+現在のownership検証は安全側に制限しています。systemdのservice drop-in、daemon-reload待ち、global arguments/wrapper付きExecStart、検証できないquote/継続行/環境変数展開等はunsupportedです。Quadletソース側の設定は生成fragmentへ反映してください。実行中containerがunitのdelegated cgroup配下にならない構成（例：`CgroupsMode`の変更）も検証できなければ拒否します。既知のreplacementは停止しませんが、unit/fragment/name/cgroup確認とmutationは原子的ではなく、外部操作との同時変更までは保証できません。
 
 Podmanはhost PIDをidentityとして公開・保存せず、Direct用PID/PGID/starttime/boot_id stateを読みません。container identityの永続化も今回は行いません。`state show` / `state clean`はunsupportedです。一方、lifecycle mutationはDirectと同じserver単位のflockを取得します。
 
@@ -108,7 +125,7 @@ RCON "stop"
 → 戻る
 ```
 
-`restart --term` / `--kill --force`の既存escalationルールはそのままです。escalationは待機タイムアウト時だけ行い、RCONの通信エラーでは行いません。
+escalationは待機タイムアウト時だけ行い、RCONの通信エラーでは行いません。Directの`restart --term` / `--kill --force`の既存挙動は維持します。PodmanのTERM-onlyは上記のとおりunsupportedです。
 
 RCONの`Command`は「配送を受け付けた」ことを成功とし、コマンドの効果完了までは待ちません。`stop`ではサーバーが応答前に終了し得るため、認証成功後にcommand packetを完全にwriteできた時点で成功とします。終了確認は`Runtime.Wait`が行います。RCON接続はCLI invocationを跨いで維持せず、各`Command`でdial → authenticate → command write → closeします。
 

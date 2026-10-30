@@ -73,14 +73,15 @@ func (r *Runtime) call(ctx context.Context, tool string, args ...string) ([]byte
 func external(message string) error { return fmt.Errorf("%s: %w", message, app.ErrExternal) }
 
 type inspection struct {
-	ID     string `json:"Id"`
-	Status string `json:"Status"`
+	ID         string `json:"Id"`
+	Status     string `json:"Status"`
+	CgroupPath string `json:"CgroupPath"`
 }
 
 var fullID = regexp.MustCompile(`^[0-9a-f]{64}$`)
 
-// Only request the two non-secret fields we need, not a full inspect document.
-const inspectFormat = `{"Id":{{json .ID}},"Status":{{json .State.Status}}}`
+// Request only non-secret identity, liveness and ownership fields.
+const inspectFormat = `{"Id":{{json .ID}},"Status":{{json .State.Status}},"CgroupPath":{{json .State.CgroupPath}}}`
 
 func (r *Runtime) inspect(ctx context.Context, target string) (inspection, bool, error) {
 	out, err := r.call(ctx, "podman", "inspect", "--type=container", "--format", inspectFormat, target)
@@ -213,6 +214,9 @@ func (r *Runtime) Start(ctx context.Context) error {
 	if err := r.unitStopped(ctx, r.generationID != ""); err != nil {
 		return err
 	}
+	if _, err := r.unitOwnership(ctx); err != nil {
+		return err
+	}
 	if _, err := r.call(ctx, "systemctl", "--user", "start", r.cfg.Unit); err != nil {
 		return err
 	}
@@ -222,6 +226,13 @@ func (r *Runtime) Start(ctx context.Context) error {
 	}
 	if !exists || info.Status != "running" {
 		return external("unit start did not produce a running container")
+	}
+	group, err := r.unitOwnership(ctx)
+	if err != nil {
+		return err
+	}
+	if err := containerOwnership(group, info); err != nil {
+		return err
 	}
 	r.generationID = info.ID
 	return nil
@@ -264,11 +275,16 @@ func (r *Runtime) Wait(ctx context.Context) (runtime.ExitStatus, error) {
 func (r *Runtime) Signal(ctx context.Context, signal runtime.Signal) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if signal != runtime.Terminate && signal != runtime.Kill {
-		return app.ErrUnsupported
-	}
 	if err := ctx.Err(); err != nil {
 		return err
+	}
+	// A Quadlet stop job may force-kill after StopTimeout, even after our
+	// caller has timed out. Never leave such a job behind for TERM-only.
+	if signal == runtime.Terminate {
+		return fmt.Errorf("Quadlet TERM-only cannot guarantee no forced kill: %w", app.ErrUnsupported)
+	}
+	if signal != runtime.Kill {
+		return app.ErrUnsupported
 	}
 	if r.generationID == "" {
 		return app.ErrNotRunning
@@ -289,11 +305,18 @@ func (r *Runtime) Signal(ctx context.Context, signal runtime.Signal) error {
 	if !exists || current.ID != r.generationID {
 		return fmt.Errorf("unit no longer owns pinned generation: %w", app.ErrStateUnknown)
 	}
-	if _, err := r.call(ctx, "systemctl", "--user", "stop", "--no-block", r.cfg.Unit); err != nil {
+	group, err := r.unitOwnership(ctx)
+	if err != nil {
 		return err
 	}
-	if signal == runtime.Terminate {
-		return nil
+	if err := containerOwnership(group, info); err != nil {
+		return err
+	}
+	if err := containerOwnership(group, current); err != nil {
+		return err
+	}
+	if _, err := r.call(ctx, "systemctl", "--user", "stop", "--no-block", r.cfg.Unit); err != nil {
+		return err
 	}
 	_, err = r.call(ctx, "podman", "kill", "--signal", "KILL", r.generationID)
 	if err != nil && ctx.Err() == nil {

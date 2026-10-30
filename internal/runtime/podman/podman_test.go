@@ -6,6 +6,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
@@ -21,6 +23,7 @@ var idA = strings.Repeat("a", 64)
 var idB = strings.Repeat("b", 64)
 var ctx = context.Background()
 var cfg = Config{Unit: "minecraft-rail.service", Container: "minecraft-rail"}
+var serviceGroup = "/user.slice/user-1000.slice/user@1000.service/app.slice/" + cfg.Unit
 
 type exitError int
 
@@ -36,7 +39,16 @@ type step struct {
 }
 
 func inspectStep(target, id, status string) step {
-	return step{tool: "podman", args: []string{"inspect", "--type=container", "--format", inspectFormat, target}, out: fmt.Sprintf(`{"Id":%q,"Status":%q}`, id, status)}
+	return step{tool: "podman", args: []string{"inspect", "--type=container", "--format", inspectFormat, target}, out: fmt.Sprintf(`{"Id":%q,"Status":%q,"CgroupPath":%q}`, id, status, serviceGroup+"/libpod-payload-"+id)}
+}
+
+func ownershipStep(t *testing.T) step {
+	t.Helper()
+	fragment := filepath.Join(t.TempDir(), cfg.Unit)
+	if err := os.WriteFile(fragment, []byte("[Service]\nExecStart=/usr/bin/podman run --name minecraft-rail --cidfile=%t/%N.cid --replace --rm --cgroups=split --stop-timeout 180 docker.io/library/eclipse-temurin:21-jdk-noble ./run.sh nogui\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	return step{tool: "systemctl", args: append(append([]string(nil), ownershipProperties...), cfg.Unit), out: "Id=" + cfg.Unit + "\nLoadState=loaded\nUnitFileState=generated\nSourcePath=/home/user/.config/containers/systemd/rail.container\nFragmentPath=" + fragment + "\nDropInPaths=\nNeedDaemonReload=no\nControlGroup=" + serviceGroup + "\n"}
 }
 func absentSteps(target string) []step {
 	return []step{
@@ -121,7 +133,7 @@ func TestInspectFormat(t *testing.T) {
 	var out bytes.Buffer
 	data := struct {
 		ID    string
-		State struct{ Status string }
+		State struct{ Status, CgroupPath string }
 	}{ID: idA}
 	data.State.Status = "running"
 	if err := tmpl.Execute(&out, data); err != nil {
@@ -171,7 +183,7 @@ func TestWaitFailureIsNotContainerExit(t *testing.T) {
 func TestKillRequiresSuccessfulStopJob(t *testing.T) {
 	bad := stopStep()
 	bad.err = exitError(1)
-	r := scripted(t, inspectStep(idA, idA, "running"), inspectStep(cfg.Container, idA, "running"), bad)
+	r := scripted(t, inspectStep(idA, idA, "running"), inspectStep(cfg.Container, idA, "running"), ownershipStep(t), bad)
 	r.generationID = idA
 	if err := r.Signal(ctx, runtime.Kill); app.ExitCode(err) != 10 {
 		t.Fatal(err)
@@ -180,7 +192,7 @@ func TestKillRequiresSuccessfulStopJob(t *testing.T) {
 
 func TestKillToleratesExecStopRemoval(t *testing.T) {
 	bad := step{tool: "podman", args: []string{"kill", "--signal", "KILL", idA}, err: exitError(125)}
-	steps := []step{inspectStep(idA, idA, "running"), inspectStep(cfg.Container, idA, "running"), stopStep(), bad}
+	steps := []step{inspectStep(idA, idA, "running"), inspectStep(cfg.Container, idA, "running"), ownershipStep(t), stopStep(), bad}
 	steps = append(steps, absentSteps(idA)...)
 	r := scripted(t, steps...)
 	r.generationID = idA
@@ -212,7 +224,7 @@ func TestGenerationNeverRebinds(t *testing.T) {
 func TestStart(t *testing.T) {
 	steps := append(absentSteps(cfg.Container), unitStep("inactive"))
 	steps = append(steps, absentSteps(cfg.Container)...)
-	steps = append(steps, unitStep("inactive"), startStep(), inspectStep(cfg.Container, idB, "running"))
+	steps = append(steps, unitStep("inactive"), ownershipStep(t), startStep(), inspectStep(cfg.Container, idB, "running"), ownershipStep(t))
 	r := scripted(t, steps...)
 	if err := r.Start(ctx); err != nil {
 		t.Fatal(err)
@@ -243,7 +255,7 @@ func TestStartRejectsReplacement(t *testing.T) {
 func TestSystemctlFailureIsExternal(t *testing.T) {
 	bad := startStep()
 	bad.err = errors.New("executable missing")
-	r := scripted(t, inspectStep(cfg.Container, idA, "exited"), inspectStep(cfg.Container, idA, "exited"), unitStep("inactive"), bad)
+	r := scripted(t, inspectStep(cfg.Container, idA, "exited"), inspectStep(cfg.Container, idA, "exited"), unitStep("inactive"), ownershipStep(t), bad)
 	err := r.Start(ctx)
 	if app.ExitCode(err) != 10 || strings.Contains(err.Error(), "sensitive") {
 		t.Fatal(err)
@@ -312,38 +324,38 @@ func TestWaitCancellationAndRetry(t *testing.T) {
 	}
 }
 
-func TestSignals(t *testing.T) {
-	for _, sig := range []runtime.Signal{runtime.Terminate, runtime.Kill} {
-		t.Run(string(sig), func(t *testing.T) {
-			steps := []step{inspectStep(idA, idA, "running"), inspectStep(cfg.Container, idA, "running"), stopStep()}
-			if sig == runtime.Kill {
-				steps = append(steps, step{tool: "podman", args: []string{"kill", "--signal", "KILL", idA}})
-			}
-			r := scripted(t, steps...)
-			r.generationID = idA
-			if err := r.Signal(ctx, sig); err != nil {
-				t.Fatal(err)
-			}
-		})
+func TestKillUsesPinnedIDAfterStopJob(t *testing.T) {
+	r := scripted(t, inspectStep(idA, idA, "running"), inspectStep(cfg.Container, idA, "running"), ownershipStep(t), stopStep(), step{tool: "podman", args: []string{"kill", "--signal", "KILL", idA}})
+	r.generationID = idA
+	if err := r.Signal(ctx, runtime.Kill); err != nil {
+		t.Fatal(err)
 	}
 }
 
-func TestSignalsDoNotTouchReplacement(t *testing.T) {
-	for _, sig := range []runtime.Signal{runtime.Terminate, runtime.Kill} {
-		t.Run(string(sig), func(t *testing.T) {
-			r := scripted(t, absentSteps(idA)...)
-			r.generationID = idA
-			if err := r.Signal(ctx, sig); err != nil {
-				t.Fatal(err)
-			}
-		})
-		t.Run(string(sig)+" mismatch", func(t *testing.T) {
-			r := scripted(t, inspectStep(idA, idA, "running"), inspectStep(cfg.Container, idB, "running"))
-			r.generationID = idA
-			if err := r.Signal(ctx, sig); !errors.Is(err, app.ErrStateUnknown) {
-				t.Fatal(err)
-			}
-		})
+func TestKillDoesNotTouchReplacement(t *testing.T) {
+	t.Run("removed", func(t *testing.T) {
+		r := scripted(t, absentSteps(idA)...)
+		r.generationID = idA
+		if err := r.Signal(ctx, runtime.Kill); err != nil {
+			t.Fatal(err)
+		}
+	})
+	t.Run("mismatch", func(t *testing.T) {
+		r := scripted(t, inspectStep(idA, idA, "running"), inspectStep(cfg.Container, idB, "running"))
+		r.generationID = idA
+		if err := r.Signal(ctx, runtime.Kill); !errors.Is(err, app.ErrStateUnknown) {
+			t.Fatal(err)
+		}
+	})
+}
+
+func TestTerminateUnsupportedWithoutSideEffects(t *testing.T) {
+	for _, id := range []string{"", idA} {
+		r := scripted(t)
+		r.generationID = id
+		if err := r.Signal(ctx, runtime.Terminate); app.ExitCode(err) != 5 {
+			t.Fatal(err)
+		}
 	}
 }
 
@@ -382,16 +394,19 @@ func TestRestartLifecycle(t *testing.T) {
 					break
 				}
 				opts.Escalation = app.WithTerm
-				steps = append(steps, inspectStep(idA, idA, "running"), inspectStep(cfg.Container, idA, "running"), stopStep())
+				if scenario == "term" {
+					wantErr = app.ErrUnsupported
+					break
+				}
 				if scenario == "kill" {
 					opts.Escalation = app.WithKill
 					opts.AllowSIGKILL = true
-					steps = append(steps, blocked, inspectStep(idA, idA, "running"), inspectStep(cfg.Container, idA, "running"), stopStep(), step{tool: "podman", args: []string{"kill", "--signal", "KILL", idA}})
+					steps = append(steps, inspectStep(idA, idA, "running"), inspectStep(cfg.Container, idA, "running"), ownershipStep(t), stopStep(), step{tool: "podman", args: []string{"kill", "--signal", "KILL", idA}})
 				}
 				steps = append(steps, waitStep("0"))
 			}
 			if wantErr == nil {
-				steps = append(steps, inspectStep(idA, idA, "exited"), inspectStep(cfg.Container, idA, "exited"), unitStep("deactivating"), startStep(), inspectStep(cfg.Container, idB, "running"))
+				steps = append(steps, inspectStep(idA, idA, "exited"), inspectStep(cfg.Container, idA, "exited"), unitStep("deactivating"), ownershipStep(t), startStep(), inspectStep(cfg.Container, idB, "running"), ownershipStep(t))
 			}
 			r := scripted(t, steps...)
 			commands := 0
@@ -405,7 +420,7 @@ func TestRestartLifecycle(t *testing.T) {
 				}
 				return nil
 			}}
-			_, err := (app.Service{Runtime: r, Minecraft: mc}).Restart(ctx, opts)
+			result, err := (app.Service{Runtime: r, Minecraft: mc}).Restart(ctx, opts)
 			if !errors.Is(err, wantErr) {
 				t.Fatalf("error=%v want=%v", err, wantErr)
 			}
@@ -414,6 +429,11 @@ func TestRestartLifecycle(t *testing.T) {
 			}
 			if scenario != "kill requires force" && commands != 1 {
 				t.Fatal("missing graceful stop")
+			}
+			for _, event := range result.Events {
+				if event == app.TermSent || event == app.TermTimedOut {
+					t.Fatalf("Podman must not send TERM or wait on a TERM stage: %v", result.Events)
+				}
 			}
 		})
 	}
