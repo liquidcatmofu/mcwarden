@@ -83,7 +83,9 @@ password_file = "~/.config/mcwarden/secrets/rail-rcon-password"
 
 `start --no-wait`は`systemctl --user start`後、running containerのIDをpinして返します。Minecraft readinessの成功ではありません。`status`はRuntimeのlivenessのみを確認し、health/TPSやMinecraft起動完了は判定しません。主な動作対象は`start --no-wait`・`stop`・`restart --no-wait`・`status`です。Readiness Observerは今回も未実装のため、通常の`start` / `restart`は引き続きunsupported（終了コード5）です。
 
-一度pinしたRuntime instanceは、同名containerが再作成されてもreplacementへ自動追従しません。旧IDの終了を待ち、明示的な`Start`成功時だけ次世代をpinします。新しいCLI invocationは名前から現在の世代を発見できます。Quadletによるauto-removeでWait開始前に旧containerが削除されていた場合、終了確認は成功、exit statusは`Known=false`となります。137等のexit codeからsignalを推測しません。containerが無いのにunitがactive/activating等の場合や、paused/stopping等は安全に停止済みと判断できないためUnknown/errorです。
+初回の`State`はcontainer名からrunning containerを発見したあと、configured Quadlet unitのownershipとcontainerのcgroupを検証してからfull IDをpinします。検証できなければUnknown/errorを返し、pinもRCON stopも行いません。これによりfresh invocationの`status`・`stop`・`restart`も設定不一致をfail-closedで拒否します。
+
+一度pinしたRuntime instanceは、同名containerが再作成されてもreplacementへ自動追従しません。旧IDの終了を待ち、明示的な`Start`成功時だけ次世代をpinします。新しいCLI invocationはownership検証を経て名前から現在の世代を発見できます。Quadletによるauto-removeでWait開始前に旧containerが削除されていた場合、終了確認は成功、exit statusは`Known=false`となります。137等のexit codeからsignalを推測しません。containerが無いのにunitがactive/activating等の場合や、paused/stopping等は安全に停止済みと判断できないためUnknown/errorです。
 
 通常の`stop`はRCON `stop` → 旧IDのWaitです。Minecraftの正常終了（code 0）はunitの`Restart=on-failure`では再起動しない前提です。`restart --no-wait`はその後systemdで起動し、新IDをpinします。
 
@@ -100,7 +102,7 @@ systemctl --user stop --no-block <verified-unit>
 
 先にstop jobを入れてsystemdの`Restart=on-failure`によるreplacement起動を抑止します。generic lifecycleでskipできるのは`Signal(Terminate)`の`ErrUnsupported`だけです。他のTERMエラー、Waitのunsupported、RCON失敗や親contextのキャンセルからKILLへ進むことはありません。Directは従来どおりTERM → TERM待機timeout → KILLです。
 
-Start/Killの前に、`systemctl --user show`でloaded/generatedな`.container`由来のunitであること、canonical unit名、生成fragmentが現在のロード内容と一致することを検証します。生成fragmentの`ExecStart`が設定container名を指定する直接の`podman run --name ...`でなければmutationを拒否します。KILL前とStart後には、Podman inspectの`State.CgroupPath`がunitの`ControlGroup`配下であることも確認します。名前や任意のlabelだけをownershipの証拠にしません。
+初回のrunning generation発見時とStart/Killの前に、`systemctl --user show`でloaded/generatedな`.container`由来のunitであること、canonical unit名、生成fragmentが現在のロード内容と一致することを検証します。生成fragmentの`ExecStart`が設定container名を指定する直接の`podman run --name ...`でなければpinもmutationも拒否します。初回pin前・KILL前・Start後には、Podman inspectの`State.CgroupPath`がunitの`ControlGroup`配下であることも確認します。名前や任意のlabelだけをownershipの証拠にしません。
 
 現在のownership検証は安全側に制限しています。systemdのservice drop-in、daemon-reload待ち、global arguments/wrapper付きExecStart、検証できないquote/継続行/環境変数展開等はunsupportedです。Quadletソース側の設定は生成fragmentへ反映してください。実行中containerがunitのdelegated cgroup配下にならない構成（例：`CgroupsMode`の変更）も検証できなければ拒否します。既知のreplacementは停止しませんが、unit/fragment/name/cgroup確認とmutationは原子的ではなく、外部操作との同時変更までは保証できません。
 

@@ -98,7 +98,7 @@ func TestState(t *testing.T) {
 		want    runtime.State
 		wantErr bool
 	}{
-		{"running", []step{inspectStep(cfg.Container, idA, "running")}, runtime.Running, false},
+		{"running", []step{inspectStep(cfg.Container, idA, "running"), ownershipStep(t)}, runtime.Running, false},
 		{"exited", []step{inspectStep(cfg.Container, idA, "exited")}, runtime.Stopped, false},
 		{"absent", append(absentSteps(cfg.Container), unitStep("inactive")), runtime.Stopped, false},
 		{"absent active", append(absentSteps(cfg.Container), unitStep("active")), runtime.Unknown, true},
@@ -202,10 +202,10 @@ func TestKillToleratesExecStopRemoval(t *testing.T) {
 }
 
 func TestGenerationNeverRebinds(t *testing.T) {
-	steps := []step{inspectStep(cfg.Container, idA, "running"), inspectStep(idA, idA, "exited")}
+	steps := []step{inspectStep(cfg.Container, idA, "running"), ownershipStep(t), inspectStep(idA, idA, "running"), inspectStep(idA, idA, "exited")}
 	steps = append(steps, absentSteps(idA)...)
 	r := scripted(t, steps...)
-	for _, want := range []runtime.State{runtime.Running, runtime.Stopped, runtime.Stopped} {
+	for _, want := range []runtime.State{runtime.Running, runtime.Running, runtime.Stopped, runtime.Stopped} {
 		s, err := r.State(ctx)
 		if s != want || err != nil {
 			t.Fatalf("%s %v", s, err)
@@ -215,7 +215,7 @@ func TestGenerationNeverRebinds(t *testing.T) {
 		t.Fatal("rebound")
 	}
 	// A new invocation is allowed to discover B from the configured name.
-	next := scripted(t, inspectStep(cfg.Container, idB, "running"))
+	next := scripted(t, inspectStep(cfg.Container, idB, "running"), ownershipStep(t))
 	if s, err := next.State(ctx); s != runtime.Running || err != nil || next.generationID != idB {
 		t.Fatalf("new instance: %s %v", s, err)
 	}
@@ -235,7 +235,7 @@ func TestStart(t *testing.T) {
 }
 
 func TestStartAlreadyRunning(t *testing.T) {
-	r := scripted(t, inspectStep(cfg.Container, idA, "running"))
+	r := scripted(t, inspectStep(cfg.Container, idA, "running"), ownershipStep(t))
 	if err := r.Start(ctx); !errors.Is(err, app.ErrAlreadyRunning) {
 		t.Fatal(err)
 	}
@@ -371,7 +371,7 @@ func (c control) Command(_ context.Context, command string) error { return c.com
 func TestRestartLifecycle(t *testing.T) {
 	for _, scenario := range []string{"graceful", "rcon failure", "term", "kill", "no escalation", "kill requires force"} {
 		t.Run(scenario, func(t *testing.T) {
-			steps := []step{inspectStep(cfg.Container, idA, "running")}
+			steps := []step{inspectStep(cfg.Container, idA, "running"), ownershipStep(t)}
 			opts := app.RestartOptions{NoWait: true, StopTimeout: time.Millisecond, TermTimeout: time.Millisecond, KillTimeout: time.Millisecond}
 			wantErr := error(nil)
 			switch scenario {

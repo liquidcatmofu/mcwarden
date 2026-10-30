@@ -178,6 +178,15 @@ func (r *Runtime) state(ctx context.Context) (runtime.State, error) {
 	}
 	s, err := stateOf(info)
 	if s == runtime.Running && r.generationID == "" {
+		// Discovery gates graceful RCON mutations too: do not publish a running
+		// generation until its configured Quadlet ownership is verified.
+		group, err := r.unitOwnership(ctx)
+		if err != nil {
+			return runtime.Unknown, err
+		}
+		if err := containerOwnership(group, info); err != nil {
+			return runtime.Unknown, err
+		}
 		r.generationID = info.ID
 	}
 	return s, err

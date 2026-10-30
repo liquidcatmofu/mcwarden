@@ -5,10 +5,73 @@ import (
 	"os"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/liquidcatmofu/mcwarden/internal/app"
 	"github.com/liquidcatmofu/mcwarden/internal/runtime"
 )
+
+func TestDiscoveryOwnershipGatesGracefulMutations(t *testing.T) {
+	for _, scenario := range []string{"wrong Quadlet unit", "cgroup mismatch", "ownership CLI failure", "unsupported unit"} {
+		for _, operation := range []string{"state", "status", "stop", "restart"} {
+			t.Run(scenario+"/"+operation, func(t *testing.T) {
+				settings := cfg
+				meta := ownershipStep(t)
+				want := app.ErrStateUnknown
+				switch scenario {
+				case "wrong Quadlet unit":
+					settings.Unit = "minecraft-other.service"
+					meta.args[len(meta.args)-1] = settings.Unit
+					meta.out = strings.ReplaceAll(meta.out, cfg.Unit, settings.Unit)
+					changeFragment(t, meta, "[Service]\nExecStart=/usr/bin/podman run --name minecraft-other image\n")
+					want = app.ErrConfig
+				case "cgroup mismatch":
+					meta.out = strings.Replace(meta.out, "ControlGroup="+serviceGroup, "ControlGroup=/user.slice/other.service", 1)
+				case "ownership CLI failure":
+					meta.err = exitError(1)
+					want = app.ErrExternal
+				case "unsupported unit":
+					meta.out = strings.Replace(meta.out, "NeedDaemonReload=no", "NeedDaemonReload=yes", 1)
+					want = app.ErrUnsupported
+				}
+				// The runner allows only read-only discovery calls. Any Wait,
+				// Start, systemd stop or Podman signal would fail this test.
+				r := scripted(t, inspectStep(cfg.Container, idA, "running"), meta)
+				r.cfg = settings
+				mc := control{command: func(command string) error {
+					t.Fatalf("ownership failure must not send RCON %q", command)
+					return nil
+				}}
+				service := app.Service{Runtime: r, Minecraft: mc}
+				var err error
+				switch operation {
+				case "state":
+					var observed runtime.State
+					observed, err = r.State(ctx)
+					if observed != runtime.Unknown {
+						t.Fatalf("state=%s", observed)
+					}
+				case "status":
+					status, statusErr := service.Status(ctx)
+					err = statusErr
+					if status.Runtime.State != runtime.Unknown {
+						t.Fatalf("status=%+v", status)
+					}
+				case "stop":
+					_, err = service.Stop(ctx, app.StopOptions{Timeout: time.Second})
+				case "restart":
+					_, err = service.Restart(ctx, app.RestartOptions{NoWait: true, StopTimeout: time.Second, TermTimeout: time.Second, KillTimeout: time.Second, Escalation: app.WithKill, AllowSIGKILL: true})
+				}
+				if !errors.Is(err, want) {
+					t.Fatalf("error=%v want=%v", err, want)
+				}
+				if r.generationID != "" {
+					t.Fatal("unverified generation was pinned")
+				}
+			})
+		}
+	}
+}
 
 func changeFragment(t *testing.T, metadata step, contents string) {
 	t.Helper()
