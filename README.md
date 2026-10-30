@@ -2,7 +2,7 @@
 
 Minecraftサーバーの運用・監視・診断を行う、Go製CLIの開発初期段階です。
 
-現在はRuntime / Minecraft Controlの境界、停止・再起動の制御、部分的なstatus取得、JSON出力とテストを実装しています。Linux向けの`DirectProcess`アダプター（`internal/runtime/direct`）とTOML設定・server selection、MCWarden管理下プロセスのidentity永続化、RCONによるMinecraft Control（`internal/minecraft/rcon`）を実装しています。`status`・`start --no-wait`・`stop`・`restart --no-wait`・`state`はCLIから利用できます。
+現在はRuntime / Minecraft Controlの境界、停止・再起動の制御、部分的なstatus取得、JSON出力とテストを実装しています。Linux向けの`DirectProcess`アダプター（`internal/runtime/direct`）、Quadlet-backed Podmanアダプター（`internal/runtime/podman`）とTOML設定・server selection、Direct管理下プロセスのidentity永続化、RCONによるMinecraft Control（`internal/minecraft/rcon`）を実装しています。`status`・`start --no-wait`・`stop`・`restart --no-wait`はCLIから利用できます。`state`はDirect専用です。
 
 Readiness Observerはまだ実装していません。RCON接続はcommand transportであり、Minecraftの起動完了やhealthの証拠ではありません。そのため既定の`start`と`restart`はreadiness unsupportedで終了コード5を返します。`kill`のCLI配線もまだです。
 
@@ -51,6 +51,44 @@ mcwarden status -s rail --json
 
 `[servers.<name>.minecraft]`が無い場合、Minecraft Controlはunsupportedのままです。`control = "rcon"`には`[servers.<name>.minecraft.rcon]`と`password_file`が必要です。未知のcontrol名や未知のTOMLキーは設定エラーになります。
 
+## Quadlet-backed Podman Runtime
+
+対象は **rootless Podman + Quadlet + user systemd** です。同じユーザーのhost上で`systemctl --user`と`podman` CLIを使用します。Podman socket/APIやDBusへ直接接続せず、MCWardenはQuadletファイルの生成・編集、image build/pull/updateも行いません。事前にQuadletとuser unitを構成してください。
+
+```toml
+default_server = "rail"
+
+[servers.rail]
+runtime = "podman"
+
+[servers.rail.podman]
+unit = "minecraft-rail.service"
+container = "minecraft-rail"
+
+[servers.rail.minecraft]
+control = "rcon"
+
+[servers.rail.minecraft.rcon]
+address = "127.0.0.1:25575"
+password_file = "~/.config/mcwarden/secrets/rail-rcon-password"
+```
+
+`podman` table、`unit`（`.service`名）、`container`は必須です。`direct`設定は使用しません。責務は次のように分離します。
+
+| 責務 | authority |
+| --- | --- |
+| Start / escalation coordination | systemd user unit |
+| generation observation / wait | Podmanのfull container ID |
+| Minecraft graceful stop | 既存RCON |
+
+`start --no-wait`は`systemctl --user start`後、running containerのIDをpinして返します。Minecraft readinessの成功ではありません。`status`はRuntimeのlivenessのみを確認し、health/TPSやMinecraft起動完了は判定しません。主な動作対象は`start --no-wait`・`stop`・`restart --no-wait`・`status`です。Readiness Observerは今回も未実装のため、通常の`start` / `restart`は引き続きunsupported（終了コード5）です。
+
+一度pinしたRuntime instanceは、同名containerが再作成されてもreplacementへ自動追従しません。旧IDの終了を待ち、明示的な`Start`成功時だけ次世代をpinします。新しいCLI invocationは名前から現在の世代を発見できます。Quadletによるauto-removeでWait開始前に旧containerが削除されていた場合、終了確認は成功、exit statusは`Known=false`となります。137等のexit codeからsignalを推測しません。containerが無いのにunitがactive/activating等の場合や、paused/stopping等は安全に停止済みと判断できないためUnknown/errorです。
+
+通常の`stop`はRCON `stop` → 旧IDのWaitです。Minecraftの正常終了（code 0）はunitの`Restart=on-failure`では再起動しない前提です。`restart --no-wait`はその後systemdで起動し、新IDをpinします。`--term`によるescalationは`systemctl --user stop --no-block`でQuadletのExecStopへ委譲します。`--kill --force`も先にそのstop jobを入れてsystemdのrestart policyを抑止し、その後**pin済みIDだけ**へ`podman kill --signal KILL`を送ります。RCON失敗ではescalateしません。既知のreplacementは停止しませんが、unit/name確認とstop job投入は別CLI呼び出しであり、外部操作との原子的な同期は保証できません。
+
+Podmanはhost PIDをidentityとして公開・保存せず、Direct用PID/PGID/starttime/boot_id stateを読みません。container identityの永続化も今回は行いません。`state show` / `state clean`はunsupportedです。一方、lifecycle mutationはDirectと同じserver単位のflockを取得します。
+
 ## RCON control
 
 RCONはMinecraftへのcommand transport専用です。Runtimeがプロセスのライフサイクルを所有し、RCONはコマンド送信だけを担当します。RCON adapterにRuntimeの所有権はありません。
@@ -64,9 +102,9 @@ RCONはplaintext transportです。loopback、または信頼できる暗号化�
 ```text
 RCON "stop"
 → Runtime.Wait
-→ 旧世代のidentityをclean
+→ 旧世代のidentityをclean（Directのみ）
 → Runtime.Start
-→ 新世代のidentityを保存
+→ 新世代のidentityを保存（Directのみ。PodmanはIDをinstance内でpin）
 → 戻る
 ```
 
@@ -86,7 +124,7 @@ RCON passwordはCLI引数やTOMLへ直接書かず、`password_file`から読み
 - passwordそのものはerror、JSON output、log、テストの失敗メッセージへ出しません。
 - `server.properties`の自動解析は行いません。
 
-## process identity state
+## process identity state（Direct専用）
 
 ```sh
 mcwarden -s rail start --no-wait     # プロセス起動後に返る

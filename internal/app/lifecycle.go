@@ -73,6 +73,8 @@ type Service struct {
 	// StateStore opens the persisted identity store. Bootstrap sets it; a nil
 	// value disables persistence for tests and runtimes without a host process.
 	StateStore func() (*state.Store, error)
+	// OperationLock serializes lifecycle mutations independently of identity persistence.
+	OperationLock func() (*state.Lock, error)
 }
 
 func (s Service) requireRunning(ctx context.Context) error {

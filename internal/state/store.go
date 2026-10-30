@@ -351,6 +351,11 @@ func (s *Store) Lock() (*Lock, error) {
 	return &Lock{file: f}, nil
 }
 
+// LockServer takes the lifecycle lock without opening a process identity store.
+func LockServer(server string) (*Lock, error) {
+	return (&Store{server: server}).Lock()
+}
+
 // Lock is an acquired server lock. Unlock must be called exactly once.
 type Lock struct {
 	file *os.File
