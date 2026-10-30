@@ -32,8 +32,27 @@ type Config struct {
 // Server describes one managed server.
 type Server struct {
 	// Runtime is "direct" or "podman". Empty means "direct".
-	Runtime string  `toml:"runtime"`
-	Direct  *Direct `toml:"direct"`
+	Runtime   string     `toml:"runtime"`
+	Direct    *Direct    `toml:"direct"`
+	Minecraft *Minecraft `toml:"minecraft"`
+}
+
+// Minecraft describes how MCWarden sends commands to Minecraft. It is separate
+// from the runtime because process liveness does not imply Minecraft readiness.
+type Minecraft struct {
+	// Control is the command transport. Currently only "rcon" is implemented.
+	Control string `toml:"control"`
+	RCON    *RCON  `toml:"rcon"`
+}
+
+// RCON describes the RCON command transport. The password is never stored in
+// the configuration file or passed on the command line.
+type RCON struct {
+	// Address is the RCON endpoint. Empty means 127.0.0.1:25575.
+	Address string `toml:"address"`
+	// PasswordFile holds the RCON password. A trailing LF or CRLF is removed;
+	// no other trimming is performed.
+	PasswordFile string `toml:"password_file"`
 }
 
 // Direct describes a locally executed server process.
@@ -124,6 +143,28 @@ func (c Config) validate() error {
 		default:
 			return fmt.Errorf("server %q has unknown runtime %q", name, server.Runtime)
 		}
+		if server.Minecraft != nil {
+			if err := server.Minecraft.validate(name); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+func (m Minecraft) validate(server string) error {
+	switch m.Control {
+	case "rcon":
+		if m.RCON == nil {
+			return fmt.Errorf("server %q needs a [servers.%s.minecraft.rcon] table", server, server)
+		}
+		if m.RCON.PasswordFile == "" {
+			return fmt.Errorf("server %q needs minecraft.rcon.password_file", server)
+		}
+	case "":
+		return fmt.Errorf("server %q needs minecraft.control", server)
+	default:
+		return fmt.Errorf("server %q has unknown minecraft control %q", server, m.Control)
 	}
 	return nil
 }

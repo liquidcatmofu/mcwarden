@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/liquidcatmofu/mcwarden/internal/minecraft"
+	"github.com/liquidcatmofu/mcwarden/internal/minecraft/rcon"
 	"github.com/liquidcatmofu/mcwarden/internal/runtime"
 )
 
@@ -166,6 +167,72 @@ func TestPreflightNoSideEffects(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestStopSendsMinecraftStopCommand(t *testing.T) {
+	f := &fake{state: runtime.Running}
+	result, err := (Service{Runtime: f, Minecraft: f}).Stop(context.Background(), StopOptions{Timeout: time.Second})
+	if err != nil {
+		t.Fatalf("stop: %v", err)
+	}
+	if !reflect.DeepEqual(f.calls, []string{"state", "stop", "wait"}) {
+		t.Fatalf("calls=%v", f.calls)
+	}
+	if !reflect.DeepEqual(result.Events, []Event{StopRequested, Stopped}) {
+		t.Fatalf("events=%v", result.Events)
+	}
+}
+
+// A failed RCON command is a transport failure, not a wait timeout, so it must
+// never cause TERM/KILL escalation or a restart.
+func TestRCONCommandFailureDoesNotEscalate(t *testing.T) {
+	f := &fake{state: runtime.Running, commandErr: errTransport}
+	_, err := (Service{Runtime: f, Minecraft: f}).Restart(context.Background(), RestartOptions{
+		NoWait: true, StopTimeout: time.Second, TermTimeout: time.Second, KillTimeout: time.Second,
+		Escalation: WithKill, AllowSIGKILL: true,
+	})
+	if !errors.Is(err, errTransport) {
+		t.Fatalf("err=%v", err)
+	}
+	for _, call := range f.calls {
+		if call == "term" || call == "kill" || call == "start" {
+			t.Fatalf("unexpected escalation or start: %v", f.calls)
+		}
+	}
+}
+
+// Missing or empty RCON credentials are command transport errors, not wait
+// timeouts, so they must not trigger signal escalation either.
+func TestRCONCredentialFailureDoesNotEscalate(t *testing.T) {
+	f := &fake{state: runtime.Running, commandErr: rcon.ErrEmptyPassword}
+	_, err := (Service{Runtime: f, Minecraft: f}).Restart(context.Background(), RestartOptions{
+		NoWait: true, StopTimeout: time.Second, TermTimeout: time.Second, KillTimeout: time.Second,
+		Escalation: WithKill, AllowSIGKILL: true,
+	})
+	if !errors.Is(err, rcon.ErrEmptyPassword) {
+		t.Fatalf("err=%v", err)
+	}
+	for _, call := range f.calls {
+		if call == "term" || call == "kill" || call == "start" {
+			t.Fatalf("unexpected escalation or start: %v", f.calls)
+		}
+	}
+}
+
+func TestRestartNoWaitStartsAfterGracefulExit(t *testing.T) {
+	f := &fake{state: runtime.Running}
+	result, err := (Service{Runtime: f, Minecraft: f}).Restart(context.Background(), RestartOptions{
+		NoWait: true, StopTimeout: time.Second,
+	})
+	if err != nil {
+		t.Fatalf("restart: %v", err)
+	}
+	if !reflect.DeepEqual(f.calls, []string{"state", "stop", "wait", "start"}) {
+		t.Fatalf("calls=%v", f.calls)
+	}
+	if !reflect.DeepEqual(result.Events, []Event{StopRequested, Stopped, StartRequested, ProcessStarted}) {
+		t.Fatalf("events=%v", result.Events)
 	}
 }
 

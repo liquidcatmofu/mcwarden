@@ -1,12 +1,13 @@
 # Coreの設計
 
-`internal/app`が操作を組み立て、`runtime.Runtime`がプロセス、`minecraft.Control`がMinecraftコマンドを担当する。実アダプターの前に、この境界をfakeで検証する。
+`internal/app`が操作を組み立て、`runtime.Runtime`がプロセス、`minecraft.Control`がMinecraftコマンドを担当する。実アダプターは`internal/runtime/direct`と`internal/minecraft/rcon`で、境界はfakeでも検証する。RuntimeとMinecraft Controlは責務を分離し、RCON adapterにプロセスの所有権を持たせない。
 
 ## 停止と再起動
 
-- `stop`は正常停止要求と終了待機だけを行う。タイムアウトしてもシグナルを送らない。
+- `stop`はRCONでMinecraftの`stop`を送り、正常停止要求と終了待機だけを行う。タイムアウトしてもシグナルを送らない。
 - `restart`の既定動作も正常停止のみ。`--term`でSIGTERMまで、`--kill --force`でSIGKILLまで許可する。
-- 指定した段階の待機が期限を超えた場合だけ次へ進む。通信失敗・権限エラー・呼び出し元のキャンセルでは進まない。
+- 指定した段階の待機が期限を超えた場合だけ次へ進む。通信失敗・認証失敗・権限エラー・呼び出し元のキャンセルでは進まない。
+- `Command`の成功は配送受付を意味し、コマンドの効果完了を待たない。`stop`は認証後にcommand packetを完全にwriteできた時点で成功とする。終了確認は`Runtime.Wait`が行う。
 - 終了コードが非ゼロでも、プロセス終了を確認できれば再起動できる。
 - `restart`は既定でMinecraftの起動完了まで待つ。`--start-timeout`の既定値は120秒。`--no-wait`ではプロセス起動後に返す。
 - 起動完了の観測に非対応なら、既定の再起動は停止前にエラーとする。`--no-wait`では観測を要求しない。
@@ -22,7 +23,7 @@ Runtimeの状態取得失敗はエラー。Minecraft側の取得失敗は部分�
 
 終了コードは0=成功、1=一般エラー、2=引数不正、3=停止中、4=タイムアウト、5=非対応、6=権限不足、9=確認必要、10=外部ツール失敗、130=キャンセル。7/8のhealth判定は未実装。
 
-`-i`・`-y`・確認UI、実Minecraft adapter、health判定、監視・バックアップ、パッケージマネージャー連携は次の段階。`-y`は将来もシグナル送信の許可には使わない。CLIの引数解析エラーはstderr、正常に解析できた`--json`操作の結果はstdoutへJSONで出す。`mcwarden start`は既定でMinecraftの起動完了まで待ち、observerが無ければ起動前に終了コード5を返す。`--no-wait`はプロセス起動後に返る。`mcwarden state show`は保存済みidentityと分類を表示し、`mcwarden state clean`はstale stateだけを削除する。`kill`のCLI配線はまだ。
+`-i`・`-y`・確認UI、Readiness Observer、health判定、監視・バックアップ、パッケージマネージャー連携は次の段階。`-y`は将来もシグナル送信の許可には使わない。CLIの引数解析エラーはstderr、正常に解析できた`--json`操作の結果はstdoutへJSONで出す。`mcwarden start`は既定でMinecraftの起動完了まで待ち、observerが無ければ起動前に終了コード5を返す。`--no-wait`はプロセス起動後に返る。`mcwarden restart`も既定ではreadiness preflightで終了コード5となり、`--no-wait`だけがRCONによるgraceful stop後に起動まで進む。`mcwarden state show`は保存済みidentityと分類を表示し、`mcwarden state clean`はstale stateだけを削除する。`kill`のCLI配線はまだ。
 
 ## 設定とserver selection
 
@@ -33,9 +34,27 @@ Runtimeの状態取得失敗はエラー。Minecraft側の取得失敗は部分�
 - `-c`・`-s`・`--json`はコマンドの前後どちらでも置ける。`--`以降はグローバル解析の対象外。
 - 未知のTOMLキーはエラーにする。設定のtypoを黙って無視しないため。
 - `runtime`は`direct`（既定）と`podman`。`podman`は既知だが未実装として終了コード5を返す。
+- `[servers.<name>.minecraft]`は任意。無い場合はMinecraft Control unsupported。`control`は現在`rcon`のみ実装する。
+- `control = "rcon"`には`[servers.<name>.minecraft.rcon]`と必須の`password_file`が必要。`address`の省略時は`127.0.0.1:25575`。RCON tableやpassword_fileが無い場合、未知のcontrol名は設定エラー。
 - `direct.env`は親環境への追加として扱い、同名キーは設定側が上書きする。
 - `direct.pidfile`がある場合、内容の`PID`または`PID STARTTIME`から`Adopt`を作る。STARTTIME省略時はその場でprocfsを読み、その時点のstarttimeを固定する。pidfileやプロセスが無ければ「未起動」として採用しない。`managed`な内部stateがある場合はpidfileより優先し、`stale`・`unknown`ではpidfileへfallbackしない。
 - 設定エラーは終了コード2。TOML読み込みに`github.com/BurntSushi/toml`を使う。
+
+## Minecraft RCON Control
+
+`internal/minecraft/rcon`が`minecraft.Control`を実装する。RCONはcommand transportであり、プロセスの所有権やreadiness判定を持たない。
+
+- `Capabilities`は`{Command: true, Readiness: false}`。RCON接続成功をMinecraft lifecycleの`Running`証拠にはしない。
+- 各`Command`はdial → auth packet送信 → auth response検証 → command packet write → closeを行う。接続はCLI invocationを跨いで維持しない。
+- `Command`の成功は配送受付であり、効果完了ではない。`stop`はサーバーが応答前に終了し得るため、認証成功後にcommand packetを完全にwriteできた時点で成功とする。終了確認は`Runtime.Wait`が担当する。
+- packetはlittle-endianのlength、request id、type、payload、終端2バイトで構成する。lengthは10未満と上限超過をallocate前に拒否し、truncated packetやmalformed packetは安全にエラーにする。
+- context deadlineはsocket deadlineへ反映する。deadlineが無いキャンセルでも、connectionをcloseしてdial/read/writeの待機を中断する。
+- authentication failureは専用の`ErrAuthentication`として識別する。通信失敗・認証失敗・キャンセルは`errWaitTimeout`ではないため、`stop`/`restart`のsignal escalationを引き起こさない。
+- passwordは`password_file`から読み、CLI引数やTOMLへ置かない。末尾の`\n`または`\r\n`だけを除去し、それ以外はtrimしない。空passwordはcredential error。passwordはerror・JSON・log・テスト失敗メッセージへ出さない。`server.properties`は解析しない。
+- `password_file`の読み込みは各`Command`実行時まで遅延する。credentialの不在・読取不能・空passwordはMinecraft Controlのエラーであり、`status`・`state show`・`start --no-wait`を妨げない。credential errorもwait timeoutではないためsignal escalationを引き起こさない。
+- RCONはplaintext transportである。loopbackまたは信頼できる暗号化ネットワーク内でのみ使い、インターネットへ直接公開しない。
+
+`minecraft.Observer`はまだ実装しない。RCON endpointが現在のRuntime generationに属するという十分な証拠が無いため、process runningとMinecraft runningを同一視しない。Readinessは次の段階でgeneration-scopedな証拠の設計から行う。
 
 ## process identity state
 
@@ -66,4 +85,4 @@ MCWardenが起動・採用した世代の同一性は`internal/state`が永続�
 - adopted processの生存判定は、ENOENT/ESRCH・starttime不一致・zombie/deadだけを終了とし、その他のprocfsエラーは`State`/`Signal`/`Wait`のエラーとして返す。読めないプロセスを停止済みと誤認して二重起動しないため。終了直前のprocfsはENOENTではなくESRCHを返すことがある。
 - `Config.Path`はJVM本体、または最後に`exec java ...`でJVMへ置き換わるwrapperを契約とする。process treeは探索せず、wrapperが先に終了する構成やJVMより長生きする構成は対象外。
 
-DirectProcessアダプターはCLIへ配線済みで、`status`・`start --no-wait`・`state show`/`state clean`が動作する。保存済みstateからの復元、終了確認後のstate削除、server単位のmutation lockも実装済み。Minecraft側のcontrol/readiness adapterが未実装のため、既定の`start`・`stop`・`restart`は終了コード5を返す。`kill`のCLI配線はまだ。
+DirectProcessアダプターはCLIへ配線済みで、`status`・`start --no-wait`・`state show`/`state clean`が動作する。保存済みstateからの復元、終了確認後のstate削除、server単位のmutation lockも実装済み。Minecraft RCON Controlも配線済みで、`stop`と`restart --no-wait`がRCON `stop` → `Runtime.Wait` → 新process起動まで進む。Readiness Observerが未実装のため、既定の`start`・`restart`は起動前（restartは停止前）に終了コード5を返す。`kill`のCLI配線はまだ。
