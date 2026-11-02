@@ -18,6 +18,7 @@ import (
 	"github.com/liquidcatmofu/mcwarden/internal/minecraft"
 	"github.com/liquidcatmofu/mcwarden/internal/minecraft/rcon"
 	"github.com/liquidcatmofu/mcwarden/internal/runtime"
+	"github.com/liquidcatmofu/mcwarden/internal/runtime/podman"
 	"github.com/liquidcatmofu/mcwarden/internal/state"
 )
 
@@ -65,6 +66,89 @@ env = ["MC_TEST=1"]
 `)
 	if state := statusOf(t, path, ""); state != runtime.Stopped {
 		t.Fatalf("state=%s", state)
+	}
+}
+
+func TestServicePodman(t *testing.T) {
+	path := writeConfig(t, `
+[servers.rail]
+runtime = "podman"
+[servers.rail.podman]
+unit = "minecraft-rail.service"
+container = "minecraft-rail"
+[servers.rail.direct]
+pidfile = "/must/not/be/read"
+[servers.rail.minecraft]
+control = "rcon"
+[servers.rail.minecraft.rcon]
+address = "127.0.0.1:25575"
+password_file = "/not/read/until/command"
+`)
+	// A corrupt Direct identity must not block constructing a Podman service.
+	store, err := state.Open("rail")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Dir(store.Path()), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(store.Path(), []byte("corrupt direct identity"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	service, err := Service(path, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if service.RuntimeName != "podman" || service.StateStore != nil || service.OperationLock == nil {
+		t.Fatalf("service=%+v", service)
+	}
+	if _, ok := service.Runtime.(*podman.Runtime); !ok {
+		t.Fatalf("runtime=%T", service.Runtime)
+	}
+	if _, ok := service.Runtime.(runtime.Identifiable); ok {
+		t.Fatal("Podman exposes host process identity")
+	}
+	if _, ok := service.Minecraft.(*rcon.Client); !ok {
+		t.Fatalf("control=%T", service.Minecraft)
+	}
+	ctx := context.Background()
+	if _, err := service.StateStatus(ctx); app.ExitCode(err) != 5 {
+		t.Fatalf("state show=%v", err)
+	}
+	if _, err := service.CleanState(ctx); app.ExitCode(err) != 5 {
+		t.Fatalf("state clean=%v", err)
+	}
+	// Podman must not depend on XDG_STATE_HOME, even for its lifecycle lock.
+	t.Setenv("XDG_STATE_HOME", "relative/invalid")
+	if _, err := Service(path, ""); err != nil {
+		t.Fatal(err)
+	}
+	runDir := t.TempDir()
+	if err := os.Chmod(runDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("XDG_RUNTIME_DIR", runDir)
+	lock, err := service.OperationLock()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lock.Unlock()
+	// Lifecycle must fail at the lock before ever invoking a host CLI.
+	if _, err := service.Start(ctx, app.StartOptions{NoWait: true}); !errors.Is(err, state.ErrBusy) {
+		t.Fatalf("start lock=%v", err)
+	}
+	if _, err := service.Stop(ctx, app.StopOptions{Timeout: 1}); !errors.Is(err, state.ErrBusy) {
+		t.Fatalf("stop lock=%v", err)
+	}
+	if _, err := service.Restart(ctx, app.RestartOptions{NoWait: true, StopTimeout: 1}); !errors.Is(err, state.ErrBusy) {
+		t.Fatalf("restart lock=%v", err)
+	}
+	// Readiness remains unsupported and is rejected before any mutation.
+	if _, err := service.Start(ctx, app.StartOptions{StartTimeout: 1}); app.ExitCode(err) != 5 {
+		t.Fatalf("start readiness=%v", err)
+	}
+	if _, err := service.Restart(ctx, app.RestartOptions{StartTimeout: 1, StopTimeout: 1}); app.ExitCode(err) != 5 {
+		t.Fatalf("restart readiness=%v", err)
 	}
 }
 
@@ -382,7 +466,7 @@ func TestServiceErrors(t *testing.T) {
 	}{
 		"unknown server": {valid, "missing", app.ErrConfig},
 		"missing config": {filepath.Join(t.TempDir(), "absent.toml"), "", app.ErrConfig},
-		"podman":         {writeConfig(t, "[servers.rail]\nruntime = \"podman\"\n"), "", app.ErrUnsupported},
+		"podman":         {writeConfig(t, "[servers.rail]\nruntime = \"podman\"\n"), "", app.ErrConfig},
 	} {
 		t.Run(name, func(t *testing.T) {
 			if _, err := Service(tt.path, tt.server); !errors.Is(err, tt.want) {

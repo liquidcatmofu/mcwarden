@@ -73,6 +73,8 @@ type Service struct {
 	// StateStore opens the persisted identity store. Bootstrap sets it; a nil
 	// value disables persistence for tests and runtimes without a host process.
 	StateStore func() (*state.Store, error)
+	// OperationLock serializes lifecycle mutations independently of identity persistence.
+	OperationLock func() (*state.Lock, error)
 }
 
 func (s Service) requireRunning(ctx context.Context) error {
@@ -344,10 +346,23 @@ func (s Service) Restart(ctx context.Context, opts RestartOptions) (Result, erro
 	}
 	defer m.release()
 	err = s.graceful(ctx, m, opts.StopTimeout, &result)
+	termUnsupported := false
 	if errors.Is(err, errWaitTimeout) && ctx.Err() == nil && opts.Escalation >= WithTerm {
-		err = s.signalAndWait(ctx, m, runtime.Terminate, TermSent, TermTimedOut, opts.TermTimeout, &result)
+		// Only an unsupported Signal(TERM), not an unsupported Wait or any
+		// other TERM error, may skip to the explicitly authorized KILL stage.
+		err = s.Runtime.Signal(ctx, runtime.Terminate)
+		if ctx.Err() != nil {
+			return result, ctx.Err()
+		}
+		if err != nil {
+			termUnsupported = errors.Is(err, ErrUnsupported)
+			err = fmt.Errorf("send %s: %w", runtime.Terminate, err)
+		} else {
+			result.Events = append(result.Events, TermSent)
+			err = s.wait(ctx, m, opts.TermTimeout, &result, TermTimedOut)
+		}
 	}
-	if errors.Is(err, errWaitTimeout) && ctx.Err() == nil && opts.Escalation == WithKill {
+	if (errors.Is(err, errWaitTimeout) || termUnsupported) && ctx.Err() == nil && opts.Escalation == WithKill {
 		err = s.signalAndWait(ctx, m, runtime.Kill, KillSent, KillTimedOut, opts.KillTimeout, &result)
 	}
 	if err != nil {
