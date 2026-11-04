@@ -2,7 +2,7 @@
 
 Minecraftサーバーの運用・監視・診断を行う、Go製CLIの開発初期段階です。
 
-現在はRuntime / Minecraft Control / Readiness Observerの境界、停止・再起動の制御、部分的なstatus取得、JSON出力とテストを実装しています。Linux向けの`DirectProcess`アダプター（`internal/runtime/direct`）、Quadlet-backed Podmanアダプター（`internal/runtime/podman`）とTOML設定・server selection、Direct管理下プロセスのidentity永続化、RCONによるMinecraft Control（`internal/minecraft/rcon`）、`latest.log`によるgeneration-scoped readiness（`internal/minecraft/log`）を実装しています。`status`・`start`・`stop`・`restart`はCLIから利用できます。`state`はDirect専用です。
+現在はRuntime / Minecraft Control / Readiness Observerの境界、停止・再起動の制御、部分的なstatus取得、JSON出力とテストを実装しています。Linux向けの`DirectProcess`アダプター（`internal/runtime/direct`）、Quadlet-backed Podmanアダプター（`internal/runtime/podman`）とTOML設定・server selection、Direct管理下プロセスのidentity永続化、RCONによるMinecraft Control（`internal/minecraft/rcon`）、`latest.log`によるgeneration-scoped readiness（`internal/minecraft/log`）、常駐observation用の`agent`（`internal/agent`）を実装しています。`status`・`start`・`stop`・`restart`・`agent`はCLIから利用できます。`state`はDirect専用です。
 
 Readinessは現在のRuntime generationに結び付けた`latest.log`のstartup完了行で判定します。RCON接続はcommand transportであり、Minecraftの起動完了やhealthの証拠ではありません。readiness observerを設定しない場合、既定の`start`と`restart`はreadiness unsupportedで終了コード5を返します。`kill`のCLI配線はまだです。
 
@@ -178,6 +178,59 @@ matching generationのevidenceが無い場合やgenerationが一致しない場�
 この機能の導入時点ですでに稼働しているserverは、start前boundaryが無いため`Runtime running` / `Minecraft unknown`のままです。次回MCWarden経由で`start`・`restart`・`start --no-wait`・`restart --no-wait`のいずれかにより新generationを開始した時点からevidenceを作ります。既存世代をretroactiveにready認定しません。
 
 readiness timeout、observer error、evidence保存error、context cancellationはsignal escalationの理由にしません。Start成功後のBind/observer errorでserverをSIGTERM/SIGKILLしてrollbackしません。`Running`は「現在のgenerationについてMinecraft startup completionを観測済み」という意味で、healthyを意味しません。
+
+## agent（継続観測）
+
+`mcwarden -s rail agent [--interval=2s]`は、1 processで1 serverだけを継続観測します。Runtime generationとMinecraft readinessの変化をeventとしてstdoutへ出し、`--json`では1 event = 1 JSON objectのJSON Linesを出力します。これは`status`などの単発JSON envelope（`data` / `error` / `exit_code`）とは別の契約です。
+
+```sh
+mcwarden -s rail agent
+mcwarden -s rail agent --interval=5s --json
+```
+
+agentはread-onlyです。Minecraft commandを送らず、Runtimeへsignalも送りません。自動restart、通知、health/TPS、player監視、crash原因分類、desired state、intentional/unexpected exit分類は行いません。`generation_exited`はcrashを意味しません。exit statusが取得できない場合も正常な観測結果として`exit=unknown`を出します。
+
+```text
+2026-11-04T21:30:00+09:00 rail agent_started
+2026-11-04T21:30:00+09:00 rail generation_observed runtime=running minecraft=running
+2026-11-04T22:14:31+09:00 rail generation_exited exit=unknown
+2026-11-04T22:14:33+09:00 rail generation_observed runtime=running minecraft=starting
+2026-11-04T22:15:02+09:00 rail minecraft_state_changed minecraft=running
+```
+
+event typeは`agent_started`、`snapshot`、`generation_observed`、`minecraft_state_changed`、`generation_exited`、`runtime_stopped`、`observation_error`、`observation_recovered`、`agent_stopped`です。readinessは変化したときだけeventにし、同じstateを毎poll出力しません。observer errorは`observation_error`として記録して次のpollで再試行し、復旧時に`observation_recovered`を出します。observer errorでRuntimeの終了待機を中止しません。
+
+running generationを発見すると、そのRuntime instanceの`Wait`で同じgenerationの終了を待ちます。終了を確認したら`generation_exited`を出し、そのRuntime instanceは再利用せず、Loaderからfresh Serviceを作り直して現在のgenerationを再発見します。Podmanはpin済みfull container IDを待ち、replacementへ自動rebindしません。stoppedの場合は`Wait`を呼ばず、`--interval`ごとにfresh Serviceを作り直します。設定読込、`Runtime.State`、generation、observerのerrorでもagent processは終了せず、eventを出して次のintervalで再試行します。agent lock取得不能や引数不正だけが起動失敗です。
+
+agent専用のflockは`${XDG_RUNTIME_DIR}/mcwarden/<server>.agent.lock`に置き、実行中は保持します。lifecycle mutation lockとは別なので`start`・`stop`・`restart`を妨げず、同じserverの2個目のagentだけを拒否します。`/tmp` fallbackはせず、既存state lockと同じruntime directory検証を使います。readiness evidenceへのアクセスは既存のserver単位cross-process lockを利用するため、通常CLIの`status`・`start`・`restart`と同時に動いても安全です。
+
+SIGINTとSIGTERMはagentのcontext cancelとして扱います。watcherを終了して`agent_stopped`を出し、exit 0で終了します。RuntimeへSIGTERMを転送しません。
+
+### systemd user serviceの例
+
+unitの生成・installはMCWardenでは行いません。例として次のunitを手動で配置します。
+
+```ini
+[Unit]
+Description=MCWarden agent for rail
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/mcwarden -s rail agent --interval=2s
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target
+```
+
+agentはMinecraft serviceが停止中でも監視を継続するため、`Requires=minecraft-rail.service`や`PartOf=minecraft-rail.service`は付けません。
+
+```sh
+systemctl --user daemon-reload
+systemctl --user enable --now mcwarden-agent-rail.service
+journalctl --user -u mcwarden-agent-rail.service -f
+```
 
 ## process identity state（Direct専用）
 

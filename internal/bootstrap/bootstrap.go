@@ -54,6 +54,7 @@ func Service(configPath, serverName string) (app.Service, error) {
 		return app.Service{}, err
 	}
 	service := app.Service{
+		ServerName:    name,
 		Runtime:       rt,
 		Minecraft:     control,
 		Observer:      observer,

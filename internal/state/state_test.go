@@ -324,6 +324,57 @@ func TestLockIsExclusive(t *testing.T) {
 	}
 }
 
+func TestAgentLockIsSeparateFromLifecycleLock(t *testing.T) {
+	store := newStore(t, "rail")
+	agentLock, err := store.LockAgent()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer agentLock.Unlock()
+
+	// A second agent for the same server is rejected.
+	if _, err := store.LockAgent(); !errors.Is(err, ErrBusy) {
+		t.Fatalf("second agent lock err=%v", err)
+	}
+	// Lifecycle mutations must not be blocked by the agent.
+	lifecycle, err := store.Lock()
+	if err != nil {
+		t.Fatalf("lifecycle lock while agent holds its lock: %v", err)
+	}
+	if err := lifecycle.Unlock(); err != nil {
+		t.Fatal(err)
+	}
+	if err := agentLock.Unlock(); err != nil {
+		t.Fatal(err)
+	}
+
+	// Agent and lifecycle lock files are distinct and both live in the runtime
+	// directory.
+	agentPath, err := store.agentLockPath()
+	if err != nil {
+		t.Fatal(err)
+	}
+	lifecyclePath, err := store.lockPath()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if agentPath == lifecyclePath || !strings.HasSuffix(agentPath, "rail.agent.lock") {
+		t.Fatalf("agent=%s lifecycle=%s", agentPath, lifecyclePath)
+	}
+}
+
+func TestAgentLockRejectsUnsafeRuntimeDir(t *testing.T) {
+	newStore(t, "rail")
+	dir := t.TempDir()
+	if err := os.Chmod(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("XDG_RUNTIME_DIR", dir)
+	if _, err := LockAgent("rail"); !errors.Is(err, ErrUnavailable) {
+		t.Fatalf("err=%v", err)
+	}
+}
+
 func TestFileKey(t *testing.T) {
 	if got := fileKey("rail-1.slot_2"); got != "rail-1.slot_2" {
 		t.Fatalf("safe key=%q", got)
