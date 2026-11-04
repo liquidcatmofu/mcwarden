@@ -17,7 +17,10 @@ import (
 )
 
 func TestRunningGenerationIsObserved(t *testing.T) {
-	rt := &fakeRuntime{state: runtime.Running, generation: "gen-1", generationOK: true}
+	rt := &fakeRuntime{
+		state: runtime.Running, generation: "gen-1", generationOK: true,
+		waitStarted: make(chan struct{}, 1),
+	}
 	obs := &fakeObserver{fn: func(int, string) (minecraft.State, error) {
 		return minecraft.Running, nil
 	}}
@@ -29,6 +32,11 @@ func TestRunningGenerationIsObserved(t *testing.T) {
 	defer cancel()
 
 	buf.waitFor(t, 2)
+	select {
+	case <-rt.waitStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("agent did not start waiting on the generation")
+	}
 	cancel()
 	waitRun(t, done)
 
@@ -198,7 +206,10 @@ func TestObserverErrorDoesNotStopRuntimeWaitAndRecovers(t *testing.T) {
 			return minecraft.Running, nil
 		}
 	}}
-	rt := &fakeRuntime{state: runtime.Running, generation: "gen-1", generationOK: true}
+	rt := &fakeRuntime{
+		state: runtime.Running, generation: "gen-1", generationOK: true,
+		waitStarted: make(chan struct{}, 1),
+	}
 	loader := &scriptLoader{steps: []loaderStep{{service: testService(rt, obs)}}}
 	clock := newFakeClock()
 	buf := newEventBuffer()
@@ -208,6 +219,11 @@ func TestObserverErrorDoesNotStopRuntimeWaitAndRecovers(t *testing.T) {
 
 	buf.waitFor(t, 2)
 	ticker := clock.next(t)
+	select {
+	case <-rt.waitStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("agent did not start waiting on the generation")
+	}
 	ticker.Tick()
 	obs.waitForCall(t, 2)
 	buf.waitFor(t, 3) // observation_error
