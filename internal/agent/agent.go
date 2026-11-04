@@ -51,8 +51,11 @@ type Snapshot struct {
 // Event is the typed agent event stream. It deliberately excludes passwords,
 // RCON credentials, and external command output.
 type Event struct {
-	Time       time.Time           `json:"time"`
-	Server     string              `json:"server"`
+	Time time.Time `json:"time"`
+	// Server is the selected server name. It is omitted until the name is
+	// resolved, which can only happen after the first successful load when the
+	// CLI did not specify a server.
+	Server     string              `json:"server,omitempty"`
 	Type       string              `json:"type"`
 	Generation string              `json:"generation,omitempty"`
 	Runtime    runtime.State       `json:"runtime,omitempty"`

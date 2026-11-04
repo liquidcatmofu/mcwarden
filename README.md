@@ -200,6 +200,8 @@ agentはread-onlyです。Minecraft commandを送らず、Runtimeへsignalも送
 
 event typeは`agent_started`、`snapshot`、`generation_observed`、`minecraft_state_changed`、`generation_exited`、`runtime_stopped`、`observation_error`、`observation_recovered`、`agent_stopped`です。readinessは変化したときだけeventにし、同じstateを毎poll出力しません。observer errorは`observation_error`として記録して次のpollで再試行し、復旧時に`observation_recovered`を出します。observer errorでRuntimeの終了待機を中止しません。
 
+`-s`を省略した場合、server名は最初のLoader成功まで未解決です。未解決の間のeventは`server` fieldを持たず（text出力でもserverを省略）、`agent_started`は名前の解決とagent lock取得の後に出します。これは「server未解決」と「空文字のserver名」を区別するための契約です。
+
 running generationを発見すると、そのRuntime instanceの`Wait`で同じgenerationの終了を待ちます。終了を確認したら`generation_exited`を出し、そのRuntime instanceは再利用せず、Loaderからfresh Serviceを作り直して現在のgenerationを再発見します。Podmanはpin済みfull container IDを待ち、replacementへ自動rebindしません。stoppedの場合は`Wait`を呼ばず、`--interval`ごとにfresh Serviceを作り直します。設定読込、`Runtime.State`、generation、observerのerrorでもagent processは終了せず、eventを出して次のintervalで再試行します。agent lock取得不能や引数不正だけが起動失敗です。
 
 agent専用のflockは`${XDG_RUNTIME_DIR}/mcwarden/<server>.agent.lock`に置き、実行中は保持します。lifecycle mutation lockとは別なので`start`・`stop`・`restart`を妨げず、同じserverの2個目のagentだけを拒否します。`/tmp` fallbackはせず、既存state lockと同じruntime directory検証を使います。readiness evidenceへのアクセスは既存のserver単位cross-process lockを利用するため、通常CLIの`status`・`start`・`restart`と同時に動いても安全です。

@@ -37,6 +37,7 @@ Runtimeの状態取得失敗はエラー。Minecraft側の取得失敗は部分�
 - running中は`Observer.State(ctx, generation)`をintervalごとに呼び、state変化だけをeventにする。observer errorはRuntime Waitを中止せず、次pollで再試行して復旧時にrecovery eventを出す。
 - loader、Runtime.State、generation、observerのerrorではprocessを終了せず、eventを出してinterval後にfresh Serviceから再試行する。agent lock取得不能と引数不正だけが起動失敗。
 - eventは`agent_started`、`snapshot`、`generation_observed`、`minecraft_state_changed`、`generation_exited`、`runtime_stopped`、`observation_error`、`observation_recovered`、`agent_stopped`。exit statusがKnown=falseでも正常な観測結果として扱い、crash判定に使わない。
+- `-s`省略時は最初のLoader成功までserver名が未解決である。未解決eventは`server` fieldを持たず、`agent_started`は名前解決とagent lock取得後に出す。「server未解決」と空文字のserver名を区別する。
 - stdoutはtext、`--json`は1 event = 1 objectのJSON Lines。単発commandのJSON envelopeとは別契約。password、RCON credential、外部command stderrをeventへ入れない。
 - SIGINT/SIGTERMはcontext cancelとして扱い、`agent_stopped`を出してexit 0。Runtimeへsignalを転送しない。
 - readiness evidenceの更新は既存のserver単位cross-process lockを使うため、agentと通常CLIが同時にaccessしても安全。自動restart、通知、health/TPS、crash分類、desired state、複数server監視、event DB、systemd unit生成は対象外。

@@ -285,6 +285,57 @@ func TestLoaderErrorIsRetried(t *testing.T) {
 	}
 }
 
+func TestUnresolvedServerIsOmittedUntilFirstSuccessfulLoad(t *testing.T) {
+	service := testService(&fakeRuntime{state: runtime.Stopped}, nil)
+	loader := &scriptLoader{steps: []loaderStep{
+		{err: errors.New("config temporarily unavailable")},
+		{service: service},
+	}}
+	clock := newFakeClock()
+	buf := newEventBuffer()
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		done <- Run(ctx, Options{
+			Interval: time.Second,
+			Loader:   loader.Load,
+			Output:   buf,
+			JSON:     true,
+			Clock:    clock,
+			AcquireLock: func(string) (*state.Lock, error) {
+				return &state.Lock{}, nil
+			},
+		})
+	}()
+	defer cancel()
+
+	buf.waitFor(t, 1) // observation_error before the server name is known
+	if line := buf.all()[0]; strings.Contains(line, `"server"`) {
+		t.Fatalf("unresolved event names a server: %s", line)
+	}
+
+	ticker := clock.next(t)
+	ticker.Tick()
+	buf.waitFor(t, 4) // agent_started, observation_recovered, snapshot
+	cancel()
+	waitRun(t, done)
+
+	events := decodeEvents(t, buf.all())
+	if !equalStrings(types(events), []string{
+		EventObservationError, EventAgentStarted, EventObservationRecovered, EventSnapshot, EventAgentStopped,
+	}) {
+		t.Fatalf("types=%v", types(events))
+	}
+	if events[0].Server != "" {
+		t.Fatalf("unresolved server=%q", events[0].Server)
+	}
+	for _, event := range events[1:] {
+		if event.Server != "rail" {
+			t.Fatalf("event=%+v", event)
+		}
+	}
+}
+
 func TestRuntimeStateErrorIsRetried(t *testing.T) {
 	broken := testService(&fakeRuntime{stateErr: errors.New("procfs unavailable")}, nil)
 	running := testService(&fakeRuntime{state: runtime.Running, generation: "gen-1", generationOK: true}, nil)
