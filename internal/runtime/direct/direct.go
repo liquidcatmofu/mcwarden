@@ -19,10 +19,13 @@ package direct
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
 	"os/exec"
+	"strconv"
 	"sync"
 	"syscall"
 	"time"
@@ -33,9 +36,11 @@ import (
 
 const adoptPollInterval = 100 * time.Millisecond
 
-// procRead reads a process snapshot. It is indirected so tests can inject
-// procfs failures.
-var procRead = hostlinux.Read
+// procRead and readBootID are indirected so tests can inject procfs failures.
+var (
+	procRead   = hostlinux.Read
+	readBootID = hostlinux.BootID
+)
 
 var (
 	// ErrAlreadyRunning is returned when Start is called while a managed
@@ -110,6 +115,7 @@ type Runtime struct {
 
 var _ runtime.Runtime = (*Runtime)(nil)
 var _ runtime.Identifiable = (*Runtime)(nil)
+var _ runtime.Generational = (*Runtime)(nil)
 
 // New returns a Runtime for cfg. It does not launch anything; Start or a first
 // observation does.
@@ -263,6 +269,55 @@ func (r *Runtime) Identity() (runtime.Identity, bool) {
 		Owned:       p.owned,
 		SignalGroup: p.group,
 	}, true
+}
+
+// Generation returns an opaque key for the tracked process generation. Boot ID,
+// PID, and procfs start time are combined so that PID reuse or a reboot cannot
+// produce the same key. Generation never adopts or starts a process; it reports
+// ok=false when no live generation is tracked.
+func (r *Runtime) Generation(ctx context.Context) (string, bool, error) {
+	if err := ctx.Err(); err != nil {
+		return "", false, err
+	}
+	r.mu.Lock()
+	p := r.proc
+	r.mu.Unlock()
+	if p == nil {
+		return "", false, nil
+	}
+	if p.done != nil {
+		select {
+		case <-p.done:
+			return "", false, nil
+		default:
+		}
+	} else {
+		alive, err := p.procAlive()
+		if err != nil {
+			return "", false, err
+		}
+		if !alive {
+			return "", false, nil
+		}
+	}
+	startTime := p.startTime
+	if startTime == 0 {
+		stat, err := procRead(p.pid)
+		if err != nil {
+			return "", false, fmt.Errorf("read process %d for generation: %w", p.pid, err)
+		}
+		startTime = stat.StartTime
+	}
+	if startTime == 0 {
+		return "", false, nil
+	}
+	boot, err := readBootID()
+	if err != nil {
+		return "", false, fmt.Errorf("read boot id: %w", err)
+	}
+	identity := "direct\x00" + boot + "\x00" + strconv.Itoa(p.pid) + "\x00" + strconv.FormatUint(startTime, 10)
+	sum := sha256.Sum256([]byte(identity))
+	return hex.EncodeToString(sum[:]), true, nil
 }
 
 // Start launches the configured command in a new process group. Success means

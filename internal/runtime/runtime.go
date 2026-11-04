@@ -70,3 +70,14 @@ type Identity struct {
 type Identifiable interface {
 	Identity() (Identity, bool)
 }
+
+// Generational is implemented by runtimes that can expose an opaque key for the
+// generation they currently track. The key is only meaningful to that runtime
+// and must never be parsed by callers. For the same generation, a new Runtime
+// instance in a later CLI invocation must reproduce the same key; persisted
+// readiness evidence relies on that stability. Generation must not adopt, start,
+// or replace a process/container as a side effect. ok is false while no
+// generation is pinned; for example a fresh Podman adapter before discovery.
+type Generational interface {
+	Generation(context.Context) (key string, ok bool, err error)
+}

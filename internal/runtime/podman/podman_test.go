@@ -438,3 +438,27 @@ func TestRestartLifecycle(t *testing.T) {
 		})
 	}
 }
+
+func TestGeneration(t *testing.T) {
+	r := NewWithRunner(cfg, func(context.Context, string, ...string) ([]byte, []byte, error) {
+		t.Fatal("Generation must not run external commands")
+		return nil, nil, nil
+	})
+	if _, ok, err := r.Generation(ctx); ok || err != nil {
+		t.Fatalf("unpinned generation ok=%v err=%v", ok, err)
+	}
+	r.generationID = idA
+	first, ok, err := r.Generation(ctx)
+	if err != nil || !ok || first == "" {
+		t.Fatalf("generation ok=%v err=%v key=%q", ok, err, first)
+	}
+	same, ok, err := r.Generation(ctx)
+	if err != nil || !ok || same != first {
+		t.Fatalf("same id changed key: %q %q err=%v", first, same, err)
+	}
+	r.generationID = idB
+	other, ok, err := r.Generation(ctx)
+	if err != nil || !ok || other == first {
+		t.Fatalf("replacement reused key: %q %q err=%v", first, other, err)
+	}
+}

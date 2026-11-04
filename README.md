@@ -2,9 +2,9 @@
 
 Minecraftサーバーの運用・監視・診断を行う、Go製CLIの開発初期段階です。
 
-現在はRuntime / Minecraft Controlの境界、停止・再起動の制御、部分的なstatus取得、JSON出力とテストを実装しています。Linux向けの`DirectProcess`アダプター（`internal/runtime/direct`）、Quadlet-backed Podmanアダプター（`internal/runtime/podman`）とTOML設定・server selection、Direct管理下プロセスのidentity永続化、RCONによるMinecraft Control（`internal/minecraft/rcon`）を実装しています。`status`・`start --no-wait`・`stop`・`restart --no-wait`はCLIから利用できます。`state`はDirect専用です。
+現在はRuntime / Minecraft Control / Readiness Observerの境界、停止・再起動の制御、部分的なstatus取得、JSON出力とテストを実装しています。Linux向けの`DirectProcess`アダプター（`internal/runtime/direct`）、Quadlet-backed Podmanアダプター（`internal/runtime/podman`）とTOML設定・server selection、Direct管理下プロセスのidentity永続化、RCONによるMinecraft Control（`internal/minecraft/rcon`）、`latest.log`によるgeneration-scoped readiness（`internal/minecraft/log`）を実装しています。`status`・`start`・`stop`・`restart`はCLIから利用できます。`state`はDirect専用です。
 
-Readiness Observerはまだ実装していません。RCON接続はcommand transportであり、Minecraftの起動完了やhealthの証拠ではありません。そのため既定の`start`と`restart`はreadiness unsupportedで終了コード5を返します。`kill`のCLI配線もまだです。
+Readinessは現在のRuntime generationに結び付けた`latest.log`のstartup完了行で判定します。RCON接続はcommand transportであり、Minecraftの起動完了やhealthの証拠ではありません。readiness observerを設定しない場合、既定の`start`と`restart`はreadiness unsupportedで終了コード5を返します。`kill`のCLI配線はまだです。
 
 ```sh
 go test -race ./...
@@ -36,10 +36,14 @@ env = ["JAVA_HOME=/usr/lib/jvm/temurin-21"]
 
 [servers.rail.minecraft]
 control = "rcon"
+readiness = "log"
 
 [servers.rail.minecraft.rcon]
 address = "127.0.0.1:25575" # 省略時もこの値
 password_file = "/srv/minecraft/secrets/rcon-password"
+
+[servers.rail.minecraft.log]
+path = "/srv/minecraft/logs/latest.log"
 ```
 
 `-s/--server`でサーバーを選びます。省略時は`default_server`、それが無ければ唯一のサーバーを使います。グローバルオプションはコマンドの前後どちらでも置けます。
@@ -49,7 +53,7 @@ mcwarden -c ./config.toml -s rail status
 mcwarden status -s rail --json
 ```
 
-`[servers.<name>.minecraft]`が無い場合、Minecraft Controlはunsupportedのままです。`control = "rcon"`には`[servers.<name>.minecraft.rcon]`と`password_file`が必要です。未知のcontrol名や未知のTOMLキーは設定エラーになります。
+`[servers.<name>.minecraft]`が無い場合、Minecraft Controlとreadinessはどちらもunsupportedのままです。`control`と`readiness`は独立した設定です。`control = "rcon"`には`[servers.<name>.minecraft.rcon]`と`password_file`、`readiness = "log"`には`[servers.<name>.minecraft.log]`と`path`が必要です。未知のcontrol名・readiness名や未知のTOMLキーは設定エラーになります。
 
 ## Quadlet-backed Podman Runtime
 
@@ -67,10 +71,14 @@ container = "minecraft-rail"
 
 [servers.rail.minecraft]
 control = "rcon"
+readiness = "log"
 
 [servers.rail.minecraft.rcon]
 address = "127.0.0.1:25575"
 password_file = "~/.config/mcwarden/secrets/rail-rcon-password"
+
+[servers.rail.minecraft.log]
+path = "~/minecraft/rail/logs/latest.log"
 ```
 
 `podman` table、`unit`（`.service`名）、`container`は必須です。`direct`設定は使用しません。責務は次のように分離します。
@@ -81,7 +89,7 @@ password_file = "~/.config/mcwarden/secrets/rail-rcon-password"
 | generation observation / wait | Podmanのfull container ID |
 | Minecraft graceful stop | 既存RCON |
 
-`start --no-wait`は`systemctl --user start`後、running containerのIDをpinして返します。Minecraft readinessの成功ではありません。`status`はRuntimeのlivenessのみを確認し、health/TPSやMinecraft起動完了は判定しません。主な動作対象は`start --no-wait`・`stop`・`restart --no-wait`・`status`です。Readiness Observerは今回も未実装のため、通常の`start` / `restart`は引き続きunsupported（終了コード5）です。
+`start --no-wait`は`systemctl --user start`後、running containerのIDをpinし、readiness observerが設定されていればその世代へlog boundaryをbindして返します。Minecraft readinessの成功を意味しません。`status`はRuntimeのlivenessを確認し、readiness evidenceがあればMinecraftの起動完了を表示します。health/TPSの判定は行いません。`readiness`を設定しない場合、通常の`start` / `restart`はunsupported（終了コード5）です。
 
 初回の`State`はcontainer名からrunning containerを発見したあと、configured Quadlet unitのownershipとcontainerのcgroupを検証してからfull IDをpinします。検証できなければUnknown/errorを返し、pinもRCON stopも行いません。これによりfresh invocationの`status`・`stop`・`restart`も設定不一致をfail-closedで拒否します。
 
@@ -106,7 +114,7 @@ systemctl --user stop --no-block <verified-unit>
 
 現在のownership検証は安全側に制限しています。systemdのservice drop-in、daemon-reload待ち、global arguments/wrapper付きExecStart、検証できないquote/継続行/環境変数展開等はunsupportedです。Quadletソース側の設定は生成fragmentへ反映してください。実行中containerがunitのdelegated cgroup配下にならない構成（例：`CgroupsMode`の変更）も検証できなければ拒否します。既知のreplacementは停止しませんが、unit/fragment/name/cgroup確認とmutationは原子的ではなく、外部操作との同時変更までは保証できません。
 
-Podmanはhost PIDをidentityとして公開・保存せず、Direct用PID/PGID/starttime/boot_id stateを読みません。container identityの永続化も今回は行いません。`state show` / `state clean`はunsupportedです。一方、lifecycle mutationはDirectと同じserver単位のflockを取得します。
+Podmanはhost PIDをidentityとして公開・保存せず、Direct用PID/PGID/starttime/boot_id stateを読みません。container identityの永続化も行いません。`state show` / `state clean`はunsupportedです。一方、lifecycle mutationはDirectと同じserver単位のflockを取得します。readiness evidenceはcontainer identityの永続化ではなく、`readiness/<server>.json`の独立した記録です。
 
 ## RCON control
 
@@ -131,7 +139,7 @@ escalationは待機タイムアウト時だけ行い、RCONの通信エラーで
 
 RCONの`Command`は「配送を受け付けた」ことを成功とし、コマンドの効果完了までは待ちません。`stop`ではサーバーが応答前に終了し得るため、認証成功後にcommand packetを完全にwriteできた時点で成功とします。終了確認は`Runtime.Wait`が行います。RCON接続はCLI invocationを跨いで維持せず、各`Command`でdial → authenticate → command write → closeします。
 
-RCON接続成功をMinecraft lifecycleの`Running`証拠にはしません。`process running`と`Minecraft running`は別であり、現時点ではRCON endpointが現在のRuntime generationに属するという十分な証拠がありません。Readiness Observerは次の段階で、generation-scopedな証拠の設計から実装します。
+RCON接続成功をMinecraft lifecycleの`Running`証拠にはしません。`process running`と`Minecraft running`は別です。readinessは`readiness = "log"`を設定した場合だけ、`latest.log`のstartup完了行を現在のRuntime generationに結び付けて観測します。
 
 ### password file
 
@@ -142,6 +150,34 @@ RCON passwordはCLI引数やTOMLへ直接書かず、`password_file`から読み
 - password fileの読み込みは各RCON `Command`実行時まで遅延します。
 - passwordそのものはerror、JSON output、log、テストの失敗メッセージへ出しません。
 - `server.properties`の自動解析は行いません。
+
+## Minecraft readiness（generation-scoped）
+
+`readiness = "log"`を設定すると、`start` / `restart`は次の順で新generationの証拠を作ります。
+
+```text
+Observer.Prepare（現在のlatest.logのfile identityとoffsetを記録）
+→ Runtime.Start
+→ Runtime.Generation（opaqueなgeneration key）
+→ Observer.Bind（boundaryとgeneration keyをatomicに保存）
+→ 通常start/restartは Observer.State でRunningまで待つ
+```
+
+`--no-wait`でもPrepareとBindまでは行います。そのため`mcwarden start --no-wait`の後に別invocationの`mcwarden status`を実行すると、同じgenerationの`latest.log`を追跡し、startup完了行の出現後に`Minecraft running`へ昇格できます。
+
+`Generation`はadapter固有のidentityを外側へ解析させないopaque keyです。Podmanはpin済みfull container ID、Directはboot ID・PID・procfs starttimeをsha256で結合します。`Generation`自体はprocess/containerの起動・採用・replacementへのrebindを行いません。
+
+`Prepare`時点でlogが無いことは正常で、boundaryはabsentになります。その後作成されたlogをoffset 0から読みます。同じinodeが継続しsizeが増えていればPrepare時のoffset以降だけを読み、sizeが小さければtruncate、inodeが変わればrotation/recreateとしてoffset 0から読みます。same inodeで旧offsetを超えてregrowしていても、boundary直前の内容fingerprintが一致しなければrewrite/truncateとしてoffset 0から読み直します。Prepareより前の`Done`は証拠にしません。startup完了行はlogger prefixに依存せず、同一行に`Done (`と`For help, type "help"`を含むことを要求します（vanilla / Forge）。
+
+readiness evidenceの更新はserverごとのcross-process flock下で現在recordを再読込して行います。古いgenerationの`status`が新しい`Bind`を上書きすることはなく、`ready=true`をpendingへ巻き戻すこともありません。`restart`は停止前に`Prepare`でlog設定を検証し、設定不良で稼働中serverを止めてから失敗しないようにします。実際のboundaryは`Runtime.Start`直前にもう一度取得します。
+
+readiness evidenceはDirectのprocess identityやPodmanのcontainer identityとは別に、`${XDG_STATE_HOME:-~/.local/state}/mcwarden/readiness/<server>.json`へatomicに保存します（directory 0700、file 0600）。recordはopaqueなgeneration key、ready flag、log boundaryだけを持ち、readiness consumerがserver名やPID/container IDを解析する設計ではありません。
+
+matching generationのevidenceが無い場合やgenerationが一致しない場合は`Minecraft unknown`、matching generationのpending evidenceにmarkerが無ければ`Minecraft starting`、markerを確認して`ready=true`を保存できたら`Minecraft running`です。一度readyになったgenerationはlog rotation/truncateではRunningを取り消しません。generationが変われば古いready evidenceは無効です。
+
+この機能の導入時点ですでに稼働しているserverは、start前boundaryが無いため`Runtime running` / `Minecraft unknown`のままです。次回MCWarden経由で`start`・`restart`・`start --no-wait`・`restart --no-wait`のいずれかにより新generationを開始した時点からevidenceを作ります。既存世代をretroactiveにready認定しません。
+
+readiness timeout、observer error、evidence保存error、context cancellationはsignal escalationの理由にしません。Start成功後のBind/observer errorでserverをSIGTERM/SIGKILLしてrollbackしません。`Running`は「現在のgenerationについてMinecraft startup completionを観測済み」という意味で、healthyを意味しません。
 
 ## process identity state（Direct専用）
 
@@ -164,6 +200,6 @@ server単位のflockは`start`・`stop`・`restart`・`kill`・`state clean`の�
 
 シグナル送信の直前にPID・starttime・PGIDを再検証し、不一致なら送信しません。group signalはPIDがそのgroup leaderである場合だけ行います。
 
-停止はMinecraftの`stop`だけを使用します。再起動時のシグナル送信は`--term`または`--kill --force`で明示した場合に限定し、停止確認後にだけ起動します。既定の`restart`はMinecraftの起動完了まで待つ設計ですが、Readiness Observerが未実装のため現在は終了コード5を返します。`--no-wait`ではRCONによるgraceful stop後にプロセスを起動して返します。
+停止はMinecraftの`stop`だけを使用します。再起動時のシグナル送信は`--term`または`--kill --force`で明示した場合に限定し、停止確認後にだけ起動します。既定の`restart`はreadiness observerが設定されていればMinecraftの起動完了まで待ち、無ければ停止前に終了コード5を返します。`--no-wait`ではRCONによるgraceful stop後にプロセスを起動し、readiness observerがあれば新generationへevidenceをbindして返します。
 
 [設計](docs/design.md) / [MIT License](LICENSE)

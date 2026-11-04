@@ -48,12 +48,23 @@ type Podman struct {
 var unitName = regexp.MustCompile(`^[a-zA-Z0-9_][a-zA-Z0-9_.@:\\-]*\.service$`)
 var containerName = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9_.-]*$`)
 
-// Minecraft describes how MCWarden sends commands to Minecraft. It is separate
-// from the runtime because process liveness does not imply Minecraft readiness.
+// Minecraft describes how MCWarden observes Minecraft. Command transport and
+// readiness observation are independent: neither implies the other, and process
+// liveness does not imply readiness.
 type Minecraft struct {
 	// Control is the command transport. Currently only "rcon" is implemented.
 	Control string `toml:"control"`
-	RCON    *RCON  `toml:"rcon"`
+	// Readiness selects the generation-scoped startup observer. Currently only
+	// "log" is implemented.
+	Readiness string `toml:"readiness"`
+	RCON      *RCON  `toml:"rcon"`
+	Log       *Log   `toml:"log"`
+}
+
+// Log observes Minecraft startup completion from a log file.
+type Log struct {
+	// Path is latest.log. It must be configured when readiness = "log".
+	Path string `toml:"path"`
 }
 
 // RCON describes the RCON command transport. The password is never stored in
@@ -181,9 +192,23 @@ func (m Minecraft) validate(server string) error {
 			return fmt.Errorf("server %q needs minecraft.rcon.password_file", server)
 		}
 	case "":
-		return fmt.Errorf("server %q needs minecraft.control", server)
 	default:
 		return fmt.Errorf("server %q has unknown minecraft control %q", server, m.Control)
+	}
+	switch m.Readiness {
+	case "log":
+		if m.Log == nil {
+			return fmt.Errorf("server %q needs a [servers.%s.minecraft.log] table", server, server)
+		}
+		if m.Log.Path == "" {
+			return fmt.Errorf("server %q needs minecraft.log.path", server)
+		}
+	case "":
+	default:
+		return fmt.Errorf("server %q has unknown minecraft readiness %q", server, m.Readiness)
+	}
+	if m.Control == "" && m.Readiness == "" {
+		return fmt.Errorf("server %q needs minecraft.control or minecraft.readiness", server)
 	}
 	return nil
 }

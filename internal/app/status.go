@@ -23,8 +23,11 @@ type Status struct {
 	Minecraft MinecraftStatus `json:"minecraft"`
 }
 
-// Status preserves runtime information when optional Minecraft control fails.
-// Failure to determine the runtime state is an error, not a healthy empty status.
+// Status preserves runtime information when optional Minecraft control or
+// readiness observation fails. Failure to determine the runtime state is an
+// error, not a healthy empty status. Capabilities compose command support from
+// the Control transport and readiness support from the generation-scoped
+// observer; neither is inferred from the other.
 func (s Service) Status(ctx context.Context) (Status, error) {
 	status := Status{Runtime: RuntimeStatus{State: runtime.Unknown}, Minecraft: MinecraftStatus{State: minecraft.Unknown}}
 	if err := ctx.Err(); err != nil {
@@ -41,20 +44,41 @@ func (s Service) Status(ctx context.Context) (Status, error) {
 	if state == runtime.Stopped {
 		status.Minecraft.State = minecraft.Stopped
 	}
-	if s.Minecraft == nil {
+
+	var caps minecraft.Capabilities
+	haveCaps := false
+	if s.Minecraft != nil {
+		controlCaps, err := s.Minecraft.Capabilities(ctx)
+		if ctx.Err() != nil {
+			return status, ctx.Err()
+		}
+		if err != nil {
+			status.Minecraft.Error = err.Error()
+		} else {
+			caps = controlCaps
+			haveCaps = true
+		}
+	}
+	if s.Observer != nil {
+		caps.Readiness = true
+		haveCaps = true
+	}
+	if haveCaps {
+		caps.Readiness = s.Observer != nil
+		status.Minecraft.Capabilities = &caps
+	} else if s.Minecraft == nil {
 		status.Minecraft.Error = ErrUnsupported.Error()
 		return status, nil
 	}
-	caps, err := s.Minecraft.Capabilities(ctx)
-	if ctx.Err() != nil {
-		return status, ctx.Err()
-	}
-	if err != nil {
-		status.Minecraft.Error = err.Error()
-	} else {
-		status.Minecraft.Capabilities = &caps
-		if observer, ok := s.Minecraft.(minecraft.Observer); ok && state == runtime.Running {
-			observed, err := observer.State(ctx)
+	if s.Observer != nil && state == runtime.Running {
+		generation, ok, err := s.generation(ctx)
+		if ctx.Err() != nil {
+			return status, ctx.Err()
+		}
+		if err != nil {
+			status.Minecraft.Error = err.Error()
+		} else if ok {
+			observed, err := s.Observer.State(ctx, generation)
 			if ctx.Err() != nil {
 				return status, ctx.Err()
 			}

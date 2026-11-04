@@ -68,6 +68,9 @@ type Result struct {
 type Service struct {
 	Runtime   runtime.Runtime
 	Minecraft minecraft.Control
+	// Observer observes Minecraft readiness for an explicit Runtime generation.
+	// It is separate from the command transport: RCON never proves readiness.
+	Observer minecraft.Observer
 	// RuntimeName is stored in state, for example "direct".
 	RuntimeName string
 	// StateStore opens the persisted identity store. Bootstrap sets it; a nil
@@ -155,27 +158,23 @@ func (s Service) wait(ctx context.Context, m *mutation, timeout time.Duration, r
 
 // Start validates persisted state, locks the server, launches the process, and
 // persists the new generation's identity. With NoWait it returns after process
-// launch; otherwise it waits for the Minecraft readiness observer.
+// launch; otherwise it waits for the Minecraft readiness observer. When a
+// readiness observer is configured, its evidence is prepared and bound even
+// with NoWait so a later invocation can promote the same generation.
 func (s Service) Start(ctx context.Context, opts StartOptions) (Result, error) {
 	result := Result{Events: []Event{}, State: minecraft.Unknown}
 	if err := ctx.Err(); err != nil {
 		return result, err
 	}
-	var observer minecraft.Observer
-	if !opts.NoWait {
-		if opts.StartTimeout <= 0 {
-			return result, fmt.Errorf("start timeout must be positive: %w", ErrInvalid)
-		}
-		var ok bool
-		observer, ok = s.Minecraft.(minecraft.Observer)
-		if !ok {
-			return result, ErrUnsupported
-		}
-		caps, err := s.Minecraft.Capabilities(ctx)
-		if err != nil {
-			return result, fmt.Errorf("minecraft capabilities: %w", err)
-		}
-		if !caps.Readiness {
+	readiness, hasReadiness := s.Observer.(minecraft.ReadinessObserver)
+	if !opts.NoWait && opts.StartTimeout <= 0 {
+		return result, fmt.Errorf("start timeout must be positive: %w", ErrInvalid)
+	}
+	if !opts.NoWait && !hasReadiness {
+		return result, ErrUnsupported
+	}
+	if hasReadiness {
+		if _, ok := s.Runtime.(runtime.Generational); !ok {
 			return result, ErrUnsupported
 		}
 	}
@@ -185,15 +184,19 @@ func (s Service) Start(ctx context.Context, opts StartOptions) (Result, error) {
 	}
 	defer m.release()
 	result.Events = append(result.Events, StartRequested)
-	if err := s.startGeneration(ctx, m); err != nil {
+	if err := s.startGeneration(ctx, m, readiness); err != nil {
 		return result, err
 	}
 	result.Events = append(result.Events, ProcessStarted)
 	result.State = minecraft.Starting
+	generation, err := s.bindReadiness(ctx, readiness)
+	if err != nil {
+		return result, err
+	}
 	if opts.NoWait {
 		return result, nil
 	}
-	return result, s.awaitStartup(ctx, m, opts.StartTimeout, observer, &result)
+	return result, s.awaitStartup(ctx, m, opts.StartTimeout, s.Observer, generation, &result)
 }
 
 // startGeneration is shared by Start and Restart and must be called with the
@@ -207,8 +210,9 @@ func (s Service) Start(ctx context.Context, opts StartOptions) (Result, error) {
 //
 // If the identity cannot be saved after launch, the new process is stopped
 // again rather than left untracked, because an untracked process would allow a
-// later invocation to start a second one.
-func (s Service) startGeneration(ctx context.Context, m *mutation) error {
+// later invocation to start a second one. Prepare runs immediately before
+// Runtime.Start so its boundary cannot include output from the new generation.
+func (s Service) startGeneration(ctx context.Context, m *mutation, readiness minecraft.ReadinessObserver) error {
 	if s.Runtime == nil {
 		return ErrUnsupported
 	}
@@ -216,6 +220,9 @@ func (s Service) startGeneration(ctx context.Context, m *mutation) error {
 		return err
 	}
 	if m.store == nil {
+		if err := prepareReadiness(ctx, readiness); err != nil {
+			return err
+		}
 		return s.Runtime.Start(ctx)
 	}
 
@@ -242,6 +249,9 @@ func (s Service) startGeneration(ctx context.Context, m *mutation) error {
 		return fmt.Errorf("%w: runtime reports a running process", ErrAlreadyRunning)
 	default:
 		return fmt.Errorf("cannot start while runtime state is %q: %w", runtimeState, ErrStateUnknown)
+	}
+	if err := prepareReadiness(ctx, readiness); err != nil {
+		return err
 	}
 	if err := s.Runtime.Start(ctx); err != nil {
 		return fmt.Errorf("start: %w", err)
@@ -279,6 +289,50 @@ func (s Service) identity() (state.Identity, bool) {
 		Owned:       id.Owned,
 		SignalGroup: id.SignalGroup,
 	}, true
+}
+
+func prepareReadiness(ctx context.Context, observer minecraft.ReadinessObserver) error {
+	if observer == nil {
+		return nil
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if err := observer.Prepare(ctx); err != nil {
+		return fmt.Errorf("readiness prepare: %w", err)
+	}
+	return nil
+}
+
+// bindReadiness associates the just-started generation with the prepared
+// observation boundary. It runs after Start and returns its error without
+// rolling back: an observation failure is not permission to stop the server.
+func (s Service) bindReadiness(ctx context.Context, observer minecraft.ReadinessObserver) (string, error) {
+	if observer == nil {
+		return "", nil
+	}
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
+	generation, ok, err := s.generation(ctx)
+	if err != nil {
+		return "", fmt.Errorf("readiness generation: %w", err)
+	}
+	if !ok {
+		return "", fmt.Errorf("readiness generation is unavailable: %w", ErrStateUnknown)
+	}
+	if err := observer.Bind(ctx, generation); err != nil {
+		return "", fmt.Errorf("readiness bind: %w", err)
+	}
+	return generation, nil
+}
+
+func (s Service) generation(ctx context.Context) (string, bool, error) {
+	generational, ok := s.Runtime.(runtime.Generational)
+	if !ok {
+		return "", false, nil
+	}
+	return generational.Generation(ctx)
 }
 
 // rollbackStart stops a freshly started process whose identity could not be
@@ -325,18 +379,12 @@ func (s Service) Restart(ctx context.Context, opts RestartOptions) (Result, erro
 	if err := ctx.Err(); err != nil {
 		return result, err
 	}
-	var observer minecraft.Observer
-	if !opts.NoWait {
-		var ok bool
-		observer, ok = s.Minecraft.(minecraft.Observer)
-		if !ok {
-			return result, ErrUnsupported
-		}
-		caps, err := s.Minecraft.Capabilities(ctx)
-		if err != nil {
-			return result, fmt.Errorf("minecraft capabilities: %w", err)
-		}
-		if !caps.Readiness {
+	readiness, hasReadiness := s.Observer.(minecraft.ReadinessObserver)
+	if !opts.NoWait && !hasReadiness {
+		return result, ErrUnsupported
+	}
+	if hasReadiness {
+		if _, ok := s.Runtime.(runtime.Generational); !ok {
 			return result, ErrUnsupported
 		}
 	}
@@ -345,6 +393,13 @@ func (s Service) Restart(ctx context.Context, opts RestartOptions) (Result, erro
 		return result, err
 	}
 	defer m.release()
+	// Prepare is side-effect free on the server and validates the log before it
+	// is too late: a bad path must not take down a healthy server only to fail
+	// after the graceful stop. startGeneration prepares again immediately before
+	// Start so the real boundary cannot include old-generation output.
+	if err := prepareReadiness(ctx, readiness); err != nil {
+		return result, err
+	}
 	err = s.graceful(ctx, m, opts.StopTimeout, &result)
 	termUnsupported := false
 	if errors.Is(err, errWaitTimeout) && ctx.Err() == nil && opts.Escalation >= WithTerm {
@@ -372,16 +427,20 @@ func (s Service) Restart(ctx context.Context, opts RestartOptions) (Result, erro
 		return result, err
 	}
 	result.Events = append(result.Events, StartRequested)
-	if err := s.startGeneration(ctx, m); err != nil {
+	if err := s.startGeneration(ctx, m, readiness); err != nil {
 		return result, err
 	}
 	result.Events = append(result.Events, ProcessStarted)
 	result.State = minecraft.Starting
 	result.Exit = nil
+	generation, err := s.bindReadiness(ctx, readiness)
+	if err != nil {
+		return result, err
+	}
 	if opts.NoWait {
 		return result, nil
 	}
-	err = s.awaitStartup(ctx, m, opts.StartTimeout, observer, &result)
+	err = s.awaitStartup(ctx, m, opts.StartTimeout, s.Observer, generation, &result)
 	return result, err
 }
 
@@ -413,7 +472,7 @@ func (s Service) signalAndWait(ctx context.Context, m *mutation, signal runtime.
 // retries are issued on startup failure, timeout, observer error, or cancellation.
 // A confirmed exit during startup also removes the new generation's state so a
 // retry is not blocked by a stale record.
-func (s Service) awaitStartup(ctx context.Context, m *mutation, timeout time.Duration, observer minecraft.Observer, result *Result) error {
+func (s Service) awaitStartup(ctx context.Context, m *mutation, timeout time.Duration, observer minecraft.Observer, generation string, result *Result) error {
 	child, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 	ticker := time.NewTicker(25 * time.Millisecond)
@@ -450,7 +509,7 @@ func (s Service) awaitStartup(ctx context.Context, m *mutation, timeout time.Dur
 			return fmt.Errorf("process exited before Minecraft startup completed (%s): %w", describeExit(exit), ErrStartupFailed)
 		}
 		if state == runtime.Running {
-			mcState, err := observer.State(child)
+			mcState, err := observer.State(child, generation)
 			if err != nil {
 				return finish(fmt.Errorf("startup observation: %w", err))
 			}
