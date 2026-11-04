@@ -27,8 +27,8 @@ Restart: --stop-timeout=120s --term [--term-timeout=30s]
          --start-timeout=120s [--no-wait]
 
 Global options may appear before or after the command.
-Runtime adapters and Minecraft RCON control are configured through TOML.
-start/restart without --no-wait require a readiness observer (not yet implemented).
+Runtime adapters and Minecraft control/readiness are configured through TOML.
+start/restart without --no-wait require a configured readiness observer.
 `
 
 // Loader builds the service for a selected server. An empty configPath means

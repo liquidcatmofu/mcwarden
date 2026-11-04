@@ -28,9 +28,20 @@ const (
 )
 
 // Observer is optional. State must honor cancellation and report observations
-// for the current Runtime process generation only. Missing or stale evidence
-// must yield Unknown; process liveness alone does not establish Running.
-// The Readiness capability promises that this observer can detect startup completion.
+// for the explicitly supplied Runtime generation key only. Missing or stale
+// evidence must yield Unknown; process liveness alone does not establish
+// Running. The key is opaque and must not be parsed.
 type Observer interface {
-	State(context.Context) (State, error)
+	State(context.Context, string) (State, error)
+}
+
+// ReadinessObserver can create evidence for a generation. Prepare captures the
+// runtime's observation boundary before Start, and Bind associates that boundary
+// with the generation key returned after a successful Start. Neither method owns
+// the Runtime lifecycle; a failure after Start must not signal the server.
+type ReadinessObserver interface {
+	Observer
+
+	Prepare(context.Context) error
+	Bind(context.Context, string) error
 }

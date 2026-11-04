@@ -13,6 +13,7 @@ import (
 	"github.com/liquidcatmofu/mcwarden/internal/config"
 	hostlinux "github.com/liquidcatmofu/mcwarden/internal/host/linux"
 	"github.com/liquidcatmofu/mcwarden/internal/minecraft"
+	mclog "github.com/liquidcatmofu/mcwarden/internal/minecraft/log"
 	"github.com/liquidcatmofu/mcwarden/internal/minecraft/rcon"
 	"github.com/liquidcatmofu/mcwarden/internal/runtime"
 	"github.com/liquidcatmofu/mcwarden/internal/runtime/direct"
@@ -48,13 +49,14 @@ func Service(configPath, serverName string) (app.Service, error) {
 	if err != nil {
 		return app.Service{}, err
 	}
-	control, err := minecraftControlFor(name, server)
+	control, observer, err := minecraftFor(name, server)
 	if err != nil {
 		return app.Service{}, err
 	}
 	service := app.Service{
 		Runtime:       rt,
 		Minecraft:     control,
+		Observer:      observer,
 		RuntimeName:   "direct",
 		OperationLock: func() (*state.Lock, error) { return state.LockServer(name) },
 	}
@@ -66,16 +68,47 @@ func Service(configPath, serverName string) (app.Service, error) {
 	return service, nil
 }
 
-// minecraftControlFor builds the configured command transport. A missing
-// [servers.<name>.minecraft] table leaves control unsupported; configuration
-// validation rejects a control name without its required settings. Credentials
-// are read lazily by the RCON adapter so an unavailable password file does not
+// minecraftFor builds the configured command transport and readiness observer
+// independently. A missing [servers.<name>.minecraft] table leaves both
+// unsupported. Configuration validation rejects a control or readiness name
+// without its required settings.
+func minecraftFor(name string, server config.Server) (minecraft.Control, minecraft.Observer, error) {
+	if server.Minecraft == nil {
+		return nil, nil, nil
+	}
+	control, err := minecraftControlFor(name, server)
+	if err != nil {
+		return nil, nil, err
+	}
+	var observer minecraft.Observer
+	switch server.Minecraft.Readiness {
+	case "":
+	case "log":
+		settings := server.Minecraft.Log
+		if settings == nil {
+			return nil, nil, configError(fmt.Errorf("server %q: missing minecraft.log config", name))
+		}
+		store, err := state.OpenReadiness(name)
+		if err != nil {
+			return nil, nil, fmt.Errorf("server %q: readiness state: %w", name, err)
+		}
+		observer = mclog.New(expandHome(settings.Path), store)
+	default:
+		return nil, nil, configError(fmt.Errorf("server %q: unknown minecraft readiness %q", name, server.Minecraft.Readiness))
+	}
+	return control, observer, nil
+}
+
+// minecraftControlFor builds the configured command transport. Credentials are
+// read lazily by the RCON adapter so an unavailable password file does not
 // block status or state inspection.
 func minecraftControlFor(name string, server config.Server) (minecraft.Control, error) {
 	if server.Minecraft == nil {
 		return nil, nil
 	}
 	switch server.Minecraft.Control {
+	case "":
+		return nil, nil
 	case "rcon":
 		settings := server.Minecraft.RCON
 		if settings == nil {

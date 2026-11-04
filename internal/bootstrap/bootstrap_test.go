@@ -16,6 +16,7 @@ import (
 	"github.com/liquidcatmofu/mcwarden/internal/config"
 	hostlinux "github.com/liquidcatmofu/mcwarden/internal/host/linux"
 	"github.com/liquidcatmofu/mcwarden/internal/minecraft"
+	mclog "github.com/liquidcatmofu/mcwarden/internal/minecraft/log"
 	"github.com/liquidcatmofu/mcwarden/internal/minecraft/rcon"
 	"github.com/liquidcatmofu/mcwarden/internal/runtime"
 	"github.com/liquidcatmofu/mcwarden/internal/runtime/podman"
@@ -502,5 +503,70 @@ func TestMergeEnv(t *testing.T) {
 	want := []string{"A=1", "B=3", "C=4"}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("got %v want %v", got, want)
+	}
+}
+
+func TestServiceWiresLogReadiness(t *testing.T) {
+	logPath := filepath.Join(t.TempDir(), "latest.log")
+	path := writeConfig(t, fmt.Sprintf(`
+[servers.rail.direct]
+command = "/bin/true"
+
+[servers.rail.minecraft]
+control = "rcon"
+readiness = "log"
+
+[servers.rail.minecraft.rcon]
+password_file = "/not/read/until/command"
+
+[servers.rail.minecraft.log]
+path = %q
+`, logPath))
+	service, err := Service(path, "")
+	if err != nil {
+		t.Fatalf("bootstrap: %v", err)
+	}
+	if _, ok := service.Minecraft.(*rcon.Client); !ok {
+		t.Fatalf("control=%T", service.Minecraft)
+	}
+	if _, ok := service.Observer.(*mclog.Observer); !ok {
+		t.Fatalf("observer=%T", service.Observer)
+	}
+	status, err := service.Status(context.Background())
+	if err != nil {
+		t.Fatalf("status: %v", err)
+	}
+	if status.Minecraft.Capabilities == nil || !status.Minecraft.Capabilities.Command || !status.Minecraft.Capabilities.Readiness {
+		t.Fatalf("capabilities=%+v", status.Minecraft.Capabilities)
+	}
+}
+
+func TestServiceReadinessWithoutControl(t *testing.T) {
+	path := writeConfig(t, `
+[servers.rail.direct]
+command = "/bin/true"
+
+[servers.rail.minecraft]
+readiness = "log"
+
+[servers.rail.minecraft.log]
+path = "/not/read/for/status"
+`)
+	service, err := Service(path, "")
+	if err != nil {
+		t.Fatalf("bootstrap: %v", err)
+	}
+	if service.Minecraft != nil {
+		t.Fatalf("control=%T", service.Minecraft)
+	}
+	if _, ok := service.Observer.(*mclog.Observer); !ok {
+		t.Fatalf("observer=%T", service.Observer)
+	}
+	status, err := service.Status(context.Background())
+	if err != nil {
+		t.Fatalf("status: %v", err)
+	}
+	if status.Minecraft.Capabilities == nil || status.Minecraft.Capabilities.Command || !status.Minecraft.Capabilities.Readiness {
+		t.Fatalf("capabilities=%+v", status.Minecraft.Capabilities)
 	}
 }

@@ -272,3 +272,91 @@ func TestDefaultPath(t *testing.T) {
 		t.Fatalf("got %q want %q", got, want)
 	}
 }
+
+func TestLoadMinecraftReadiness(t *testing.T) {
+	path := writeConfig(t, `
+[servers.rail.direct]
+command = "/bin/true"
+
+[servers.rail.minecraft]
+control = "rcon"
+readiness = "log"
+
+[servers.rail.minecraft.rcon]
+password_file = "/run/secret"
+
+[servers.rail.minecraft.log]
+path = "/srv/minecraft/logs/latest.log"
+`)
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	m := cfg.Servers["rail"].Minecraft
+	if m == nil || m.Control != "rcon" || m.Readiness != "log" || m.Log == nil {
+		t.Fatalf("minecraft=%+v", m)
+	}
+	if m.Log.Path != "/srv/minecraft/logs/latest.log" {
+		t.Fatalf("log path=%q", m.Log.Path)
+	}
+}
+
+func TestLoadReadinessWithoutControl(t *testing.T) {
+	path := writeConfig(t, `
+[servers.rail.direct]
+command = "/bin/true"
+
+[servers.rail.minecraft]
+readiness = "log"
+
+[servers.rail.minecraft.log]
+path = "/srv/minecraft/logs/latest.log"
+`)
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	m := cfg.Servers["rail"].Minecraft
+	if m.Control != "" || m.Readiness != "log" {
+		t.Fatalf("minecraft=%+v", m)
+	}
+}
+
+func TestLoadRejectsInvalidReadiness(t *testing.T) {
+	for name, content := range map[string]string{
+		"unknown readiness": `
+[servers.rail.direct]
+command = "/bin/true"
+[servers.rail.minecraft]
+readiness = "rcon"
+`,
+		"missing log table": `
+[servers.rail.direct]
+command = "/bin/true"
+[servers.rail.minecraft]
+readiness = "log"
+`,
+		"missing log path": `
+[servers.rail.direct]
+command = "/bin/true"
+[servers.rail.minecraft]
+readiness = "log"
+[servers.rail.minecraft.log]
+`,
+		"unknown log key": `
+[servers.rail.direct]
+command = "/bin/true"
+[servers.rail.minecraft]
+readiness = "log"
+[servers.rail.minecraft.log]
+path = "/srv/latest.log"
+pth = "typo"
+`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			if _, err := Load(writeConfig(t, content)); !errors.Is(err, ErrInvalid) {
+				t.Fatalf("err=%v", err)
+			}
+		})
+	}
+}

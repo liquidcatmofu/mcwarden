@@ -75,3 +75,50 @@ func TestSignalName(t *testing.T) {
 		}
 	}
 }
+
+func TestGenerationKey(t *testing.T) {
+	original := readBootID
+	t.Cleanup(func() { readBootID = original })
+	boot := "boot-a"
+	readBootID = func() (string, error) { return boot, nil }
+
+	generation := func(pid int, start uint64, running bool) (string, bool, error) {
+		p := &process{pid: pid, startTime: start}
+		if running {
+			p.done = make(chan struct{})
+		} else {
+			p.done = make(chan struct{})
+			close(p.done)
+		}
+		return (&Runtime{proc: p}).Generation(context.Background())
+	}
+
+	first, ok, err := generation(123, 99, true)
+	if err != nil || !ok || first == "" {
+		t.Fatalf("generation ok=%v err=%v key=%q", ok, err, first)
+	}
+	same, ok, err := generation(123, 99, true)
+	if err != nil || !ok || same != first {
+		t.Fatalf("same identity changed key: %q %q err=%v", first, same, err)
+	}
+	boot = "boot-b"
+	otherBoot, ok, err := generation(123, 99, true)
+	if err != nil || !ok || otherBoot == first {
+		t.Fatalf("boot id change reused key: %q %q err=%v", first, otherBoot, err)
+	}
+	boot = "boot-a"
+	otherStart, ok, err := generation(123, 100, true)
+	if err != nil || !ok || otherStart == first {
+		t.Fatalf("start time change reused key: %q %q err=%v", first, otherStart, err)
+	}
+	otherPID, ok, err := generation(124, 99, true)
+	if err != nil || !ok || otherPID == first {
+		t.Fatalf("pid change reused key: %q %q err=%v", first, otherPID, err)
+	}
+	if _, ok, err := generation(123, 99, false); ok || err != nil {
+		t.Fatalf("exited generation ok=%v err=%v", ok, err)
+	}
+	if _, ok, err := (&Runtime{}).Generation(context.Background()); ok || err != nil {
+		t.Fatalf("untracked generation ok=%v err=%v", ok, err)
+	}
+}

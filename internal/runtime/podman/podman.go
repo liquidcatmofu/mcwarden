@@ -5,6 +5,8 @@ package podman
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -33,9 +35,28 @@ type Runtime struct {
 }
 
 var _ runtime.Runtime = (*Runtime)(nil)
+var _ runtime.Generational = (*Runtime)(nil)
 
 func New(cfg Config) *Runtime                          { return NewWithRunner(cfg, command) }
 func NewWithRunner(cfg Config, runner Runner) *Runtime { return &Runtime{cfg: cfg, run: runner} }
+
+// Generation returns an opaque key for the pinned container generation. It
+// deliberately does not inspect or rebind: an unpinned adapter reports ok=false
+// until State discovers a verified running generation or Start pins the next
+// one. Callers must treat the key as opaque.
+func (r *Runtime) Generation(ctx context.Context) (string, bool, error) {
+	if err := ctx.Err(); err != nil {
+		return "", false, err
+	}
+	r.mu.Lock()
+	id := r.generationID
+	r.mu.Unlock()
+	if id == "" {
+		return "", false, nil
+	}
+	sum := sha256.Sum256([]byte("podman\x00" + id))
+	return hex.EncodeToString(sum[:]), true, nil
+}
 
 func command(ctx context.Context, name string, args ...string) ([]byte, []byte, error) {
 	cmd := exec.CommandContext(ctx, name, args...)
