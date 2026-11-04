@@ -167,7 +167,9 @@ Observer.Prepare（現在のlatest.logのfile identityとoffsetを記録）
 
 `Generation`はadapter固有のidentityを外側へ解析させないopaque keyです。Podmanはpin済みfull container ID、Directはboot ID・PID・procfs starttimeをsha256で結合します。`Generation`自体はprocess/containerの起動・採用・replacementへのrebindを行いません。
 
-`Prepare`時点でlogが無いことは正常で、boundaryはabsentになります。その後作成されたlogをoffset 0から読みます。同じinodeが継続しsizeが増えていればPrepare時のoffset以降だけを読み、sizeが小さければtruncate、inodeが変わればrotation/recreateとしてoffset 0から読みます。Prepareより前の`Done`は証拠にしません。startup完了行はlogger prefixに依存せず、同一行に`Done (`と`For help, type "help"`を含むことを要求します（vanilla / Forge）。
+`Prepare`時点でlogが無いことは正常で、boundaryはabsentになります。その後作成されたlogをoffset 0から読みます。同じinodeが継続しsizeが増えていればPrepare時のoffset以降だけを読み、sizeが小さければtruncate、inodeが変わればrotation/recreateとしてoffset 0から読みます。same inodeで旧offsetを超えてregrowしていても、boundary直前の内容fingerprintが一致しなければrewrite/truncateとしてoffset 0から読み直します。Prepareより前の`Done`は証拠にしません。startup完了行はlogger prefixに依存せず、同一行に`Done (`と`For help, type "help"`を含むことを要求します（vanilla / Forge）。
+
+readiness evidenceの更新はserverごとのcross-process flock下で現在recordを再読込して行います。古いgenerationの`status`が新しい`Bind`を上書きすることはなく、`ready=true`をpendingへ巻き戻すこともありません。`restart`は停止前に`Prepare`でlog設定を検証し、設定不良で稼働中serverを止めてから失敗しないようにします。実際のboundaryは`Runtime.Start`直前にもう一度取得します。
 
 readiness evidenceはDirectのprocess identityやPodmanのcontainer identityとは別に、`${XDG_STATE_HOME:-~/.local/state}/mcwarden/readiness/<server>.json`へatomicに保存します（directory 0700、file 0600）。recordはopaqueなgeneration key、ready flag、log boundaryだけを持ち、readiness consumerがserver名やPID/container IDを解析する設計ではありません。
 

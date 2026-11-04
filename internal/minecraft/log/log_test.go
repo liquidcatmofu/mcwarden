@@ -7,6 +7,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/liquidcatmofu/mcwarden/internal/minecraft"
@@ -94,6 +95,38 @@ func TestTruncateSameInode(t *testing.T) {
 	}
 	appendFile(t, path, doneLine)
 	requireState(t, o, "gen-a", minecraft.Running)
+}
+
+func TestTruncateAndRegrowPastOldBoundary(t *testing.T) {
+	o, _, path := newObserver(t)
+	writeFile(t, path, strings.Repeat("[12:00:00] [Server thread/INFO]: old output\n", 200))
+	bind(t, o, "gen-a")
+	requireState(t, o, "gen-a", minecraft.Starting)
+
+	// Same inode. The new file grows past the old boundary, and the marker is
+	// inside the region the old offset would have skipped.
+	if err := os.Truncate(path, 0); err != nil {
+		t.Fatal(err)
+	}
+	writeFile(t, path, doneLine+strings.Repeat("[12:00:01] [Server thread/INFO]: new output\n", 300))
+	requireState(t, o, "gen-a", minecraft.Running)
+}
+
+func TestNewGenerationIsNotOverwrittenByOldStatus(t *testing.T) {
+	o, store, path := newObserver(t)
+	writeFile(t, path, "[12:00:00] [Server thread/INFO]: generation a starting\n")
+	bind(t, o, "gen-a")
+	requireState(t, o, "gen-a", minecraft.Starting)
+
+	// A restart binds generation B. A later status for A must not resurrect A's
+	// pending record, and B's pending evidence must remain intact.
+	next := New(path, store)
+	bind(t, next, "gen-b")
+	requireState(t, o, "gen-a", minecraft.Unknown)
+	requireState(t, next, "gen-b", minecraft.Starting)
+
+	appendFile(t, path, doneLine)
+	requireState(t, next, "gen-b", minecraft.Running)
 }
 
 func TestInodeReplacement(t *testing.T) {

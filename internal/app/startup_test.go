@@ -3,6 +3,7 @@ package app
 import (
 	"context"
 	"errors"
+	"fmt"
 	"reflect"
 	"testing"
 	"time"
@@ -160,7 +161,7 @@ func TestRestartStartup(t *testing.T) {
 				return
 			}
 			if name != "no wait" {
-				if mc.prepares != 1 || len(mc.bindKeys) != 1 || mc.bindKeys[0] != "generation" {
+				if mc.prepares != 2 || len(mc.bindKeys) != 1 || mc.bindKeys[0] != "generation" {
 					t.Fatalf("prepares=%d bind=%v", mc.prepares, mc.bindKeys)
 				}
 			}
@@ -197,6 +198,27 @@ func TestRestartReadinessPreflight(t *testing.T) {
 		if !errors.Is(err, want) || len(f.calls) != 0 {
 			t.Fatalf("error=%v calls=%v", err, f.calls)
 		}
+	}
+}
+
+func TestRestartPreparePreflightBeforeStop(t *testing.T) {
+	for _, noWait := range []bool{false, true} {
+		t.Run(fmt.Sprintf("no-wait=%v", noWait), func(t *testing.T) {
+			rt := &startupRuntime{fake: fake{state: runtime.Running}}
+			mc := &startupControl{runtime: rt, prepareErr: errTransport}
+			_, err := (Service{Runtime: rt, Minecraft: mc, Observer: mc}).Restart(context.Background(), RestartOptions{
+				NoWait: noWait, StopTimeout: time.Second, StartTimeout: time.Second,
+			})
+			if !errors.Is(err, errTransport) {
+				t.Fatalf("err=%v", err)
+			}
+			if len(rt.calls) != 0 {
+				t.Fatalf("preflight failure touched the runtime: %v", rt.calls)
+			}
+			if mc.prepares != 1 || len(mc.bindKeys) != 0 {
+				t.Fatalf("prepares=%d bind=%v", mc.prepares, mc.bindKeys)
+			}
+		})
 	}
 }
 

@@ -3,11 +3,13 @@
 package state
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
+	"syscall"
 	"time"
 )
 
@@ -15,11 +17,14 @@ const readinessVersion = 1
 
 // LogBoundary identifies a file and a byte offset within it. Device and inode
 // together detect rotation/recreation; Offset is the last complete position the
-// observer examined.
+// observer examined. Fingerprint hashes a small window immediately before
+// Offset so a same-inode truncate that has since regrown past Offset is still
+// recognized as a rewrite.
 type LogBoundary struct {
-	Device uint64 `json:"device"`
-	Inode  uint64 `json:"inode"`
-	Offset int64  `json:"offset"`
+	Device      uint64 `json:"device"`
+	Inode       uint64 `json:"inode"`
+	Offset      int64  `json:"offset"`
+	Fingerprint string `json:"fingerprint,omitempty"`
 }
 
 // ReadinessRecord is generation-scoped evidence that Minecraft startup was
@@ -81,17 +86,79 @@ func (s *ReadinessStore) Load() (ReadinessRecord, bool, error) {
 	return rec, true, nil
 }
 
-// Save atomically replaces the readiness record. The directory is 0700 and the
-// file is 0600, matching the process identity store.
-func (s *ReadinessStore) Save(rec ReadinessRecord) error {
+// Update atomically applies a read-modify-write to this server's readiness
+// record under an exclusive cross-process lock. The callback runs with the
+// current record after re-reading it under that lock, so its generation and
+// ready decisions cannot be based on a stale Load. Returning write=false leaves
+// the record untouched.
+func (s *ReadinessStore) Update(ctx context.Context, fn func(ReadinessRecord, bool) (ReadinessRecord, bool, error)) (ReadinessRecord, bool, error) {
+	lock, err := s.lock(ctx)
+	if err != nil {
+		return ReadinessRecord{}, false, err
+	}
+	defer lock.Close()
+	if err := ctx.Err(); err != nil {
+		return ReadinessRecord{}, false, err
+	}
+
+	current, exists, err := s.Load()
+	if err != nil {
+		return ReadinessRecord{}, false, err
+	}
+	next, write, err := fn(current, exists)
+	if err != nil {
+		return ReadinessRecord{}, false, err
+	}
+	if !write {
+		return current, exists, nil
+	}
+	next.Version = readinessVersion
+	next.SavedAt = time.Now().UTC()
+	if err := s.save(next); err != nil {
+		return ReadinessRecord{}, false, err
+	}
+	return next, true, nil
+}
+
+func (s *ReadinessStore) lock(ctx context.Context) (*os.File, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if err := ensureDir(s.dir); err != nil {
+		return nil, err
+	}
+	f, err := os.OpenFile(filepath.Join(s.dir, "."+fileKey(s.server)+".lock"), os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		return nil, fmt.Errorf("open readiness lock: %w", err)
+	}
+	for {
+		err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB)
+		if err == nil {
+			return f, nil
+		}
+		if !errors.Is(err, syscall.EWOULDBLOCK) {
+			f.Close()
+			return nil, fmt.Errorf("lock readiness: %w", err)
+		}
+		select {
+		case <-ctx.Done():
+			f.Close()
+			return nil, ctx.Err()
+		case <-time.After(5 * time.Millisecond):
+		}
+	}
+}
+
+// save atomically replaces the readiness record. The caller must hold the
+// readiness lock; Update is the only caller. The directory is 0700 and the file
+// is 0600, matching the process identity store.
+func (s *ReadinessStore) save(rec ReadinessRecord) error {
 	if rec.Generation == "" {
 		return fmt.Errorf("%w: refusing to save readiness without a generation", ErrCorrupt)
 	}
 	if rec.Log != nil && rec.Log.Offset < 0 {
 		return fmt.Errorf("%w: refusing to save a negative log offset", ErrCorrupt)
 	}
-	rec.Version = readinessVersion
-	rec.SavedAt = time.Now().UTC()
 	data, err := json.MarshalIndent(rec, "", "  ")
 	if err != nil {
 		return fmt.Errorf("encode readiness: %w", err)

@@ -63,10 +63,11 @@ Runtimeの状態取得失敗はエラー。Minecraft側の取得失敗は部分�
 `internal/minecraft/log`が`latest.log`からstartup完了を観測する。`internal/state`はprocess identityとは別に、`${XDG_STATE_HOME:-~/.local/state}/mcwarden/readiness/<server>.json`へ証拠を保存する。
 
 - `runtime.Generational`は現在追跡中の世代をopaque keyで返す。Podmanは`sha256("podman\0" + full container ID)`、Directは`sha256("direct\0" + boot ID + "\0" + PID + "\0" + starttime)`。`Generation`は起動・採用・replacementへのrebindを行わない。Podmanは未pinなら`ok=false`。
-- `Prepare`は`Runtime.Start`前にlogのfile identityとoffsetを記録する。logが無いことは正常なabsent boundary。その他のアクセス失敗は無視しない。
+- `Prepare`は`Runtime.Start`前にlogのfile identityとoffset、boundary直前のfingerprintを記録する。logが無いことは正常なabsent boundary。その他のアクセス失敗は無視しない。`restart`は停止前に一度`Prepare`で設定をpreflightし、`Runtime.Start`直前にもう一度boundaryを取得する。
 - `Bind`は`Runtime.Start`成功後に得たgeneration keyとboundaryをatomicに保存する。Start成功後のBind/observer errorでserverを停止しない。
+- evidenceの更新はserverごとのcross-process flock下で現在recordを再読込して行う。古いgenerationの`status`は新しい`Bind`を上書きせず、`ready=true`をpendingへ巻き戻さない。
 - `State`はmatching generationのevidenceが無い/一致しない場合`unknown`、pendingでmarkerが無い場合`starting`、markerを確認して`ready=true`を保存できた場合`running`を返す。一度readyになった世代はlog rotation/truncateで取り消さない。世代が変われば古いevidenceは無効。
-- log boundaryは同じinodeならoffset以降、size減少ならtruncateとして0から、inode変更ならrotation/recreateとして0から読む。Prepare以前の`Done`は使わない。
+- log boundaryは同じinodeならoffset以降、size減少ならtruncateとして0から、inode変更ならrotation/recreateとして0から読む。same inodeで旧offsetを超えてregrowしても、boundary直前のfingerprintが一致しなければrewriteとして0から読む。Prepare以前の`Done`は使わない。
 - markerは同一行に`Done (`と`For help, type "help"`を含むことを要求し、logger prefixの完全一致には依存しない。
 - readinessのtimeout・observer error・保存error・cancellationはsignal escalationの理由にしない。`running`はstartup completionの観測であり、healthではない。
 - readiness observerを設定した場合、`--no-wait`でもPrepare/Bindまで行う。後続invocationの`status`が同じ世代を追跡して`starting`から`running`へ昇格できる。既存のrunning generationはstart前boundaryが無いためretroactiveにready認定しない。

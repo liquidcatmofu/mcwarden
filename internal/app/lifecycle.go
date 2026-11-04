@@ -393,6 +393,13 @@ func (s Service) Restart(ctx context.Context, opts RestartOptions) (Result, erro
 		return result, err
 	}
 	defer m.release()
+	// Prepare is side-effect free on the server and validates the log before it
+	// is too late: a bad path must not take down a healthy server only to fail
+	// after the graceful stop. startGeneration prepares again immediately before
+	// Start so the real boundary cannot include old-generation output.
+	if err := prepareReadiness(ctx, readiness); err != nil {
+		return result, err
+	}
 	err = s.graceful(ctx, m, opts.StopTimeout, &result)
 	termUnsupported := false
 	if errors.Is(err, errWaitTimeout) && ctx.Err() == nil && opts.Escalation >= WithTerm {
