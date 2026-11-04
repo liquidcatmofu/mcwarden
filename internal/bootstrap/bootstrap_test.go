@@ -70,6 +70,17 @@ env = ["MC_TEST=1"]
 	}
 }
 
+func TestServiceCarriesSelectedServerName(t *testing.T) {
+	path := writeConfig(t, "[servers.rail.direct]\ncommand = \"/bin/true\"\n")
+	service, err := Service(path, "")
+	if err != nil {
+		t.Fatalf("bootstrap: %v", err)
+	}
+	if service.ServerName != "rail" {
+		t.Fatalf("server name=%q", service.ServerName)
+	}
+}
+
 func TestServicePodman(t *testing.T) {
 	path := writeConfig(t, `
 [servers.rail]

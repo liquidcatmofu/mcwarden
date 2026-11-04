@@ -25,6 +25,23 @@ Runtimeの状態取得失敗はエラー。Minecraft側の取得失敗は部分�
 
 `-i`・`-y`・確認UI、health判定、監視・バックアップ、パッケージマネージャー連携は次の段階。`-y`は将来もシグナル送信の許可には使わない。CLIの引数解析エラーはstderr、正常に解析できた`--json`操作の結果はstdoutへJSONで出す。`mcwarden start`は既定でMinecraftの起動完了まで待ち、observerが無ければ起動前に終了コード5を返す。`--no-wait`はプロセス起動後に返るが、readiness observerがあればPrepare/Bindまでは行う。`mcwarden restart`も既定では停止前にreadiness preflightを行い、observerが無ければ終了コード5となる。`--no-wait`はRCONによるgraceful stop後に起動し、observerがあれば新generationへevidenceをbindして返る。`mcwarden state show`は保存済みidentityと分類を表示し、`mcwarden state clean`はstale stateだけを削除する。`kill`のCLI配線はまだ。
 
+## agent（継続観測）
+
+`internal/agent`は1 process = 1 serverのread-only observerである。lifecycle mutation lockやMinecraft command、Runtime signalには関与せず、agent専用flockだけを保持する。
+
+- CLIは`mcwarden -s <server> agent [--interval=2s]`。`-s`/`default_server`の選択をそのまま使う。
+- agent lockは`${XDG_RUNTIME_DIR}/mcwarden/<server>.agent.lock`。lifecycle lockとは別ファイルで、同じserverの2個目のagentだけを拒否する。runtime directoryの安全性検証と`/tmp`を使わない方針はstate lockと共通。
+- `app.Service.ServerName`はbootstrapが必ず設定し、eventのserver identityに使う。
+- snapshotは`Generation`（`runtime.Generational`のopaque key）、`Runtime`、`Minecraft`からなる。generation keyは表示・比較だけに使い、解析しない。
+- running generation発見時はそのRuntime instanceの`Wait(ctx)`で終了を待つ。Podmanはpin済みfull ID、Directは既存Wait contractを使う。終了確認後はinstanceを破棄し、fresh ServiceをLoaderから作り直す。stoppedではWaitを呼ばずintervalごとにfresh reloadする。
+- running中は`Observer.State(ctx, generation)`をintervalごとに呼び、state変化だけをeventにする。observer errorはRuntime Waitを中止せず、次pollで再試行して復旧時にrecovery eventを出す。
+- loader、Runtime.State、generation、observerのerrorではprocessを終了せず、eventを出してinterval後にfresh Serviceから再試行する。agent lock取得不能と引数不正だけが起動失敗。
+- eventは`agent_started`、`snapshot`、`generation_observed`、`minecraft_state_changed`、`generation_exited`、`runtime_stopped`、`observation_error`、`observation_recovered`、`agent_stopped`。exit statusがKnown=falseでも正常な観測結果として扱い、crash判定に使わない。
+- `-s`省略時は最初のLoader成功までserver名が未解決である。未解決eventは`server` fieldを持たず、`agent_started`は名前解決とagent lock取得後に出す。「server未解決」と空文字のserver名を区別する。
+- stdoutはtext、`--json`は1 event = 1 objectのJSON Lines。単発commandのJSON envelopeとは別契約。password、RCON credential、外部command stderrをeventへ入れない。
+- SIGINT/SIGTERMはcontext cancelとして扱い、`agent_stopped`を出してexit 0。Runtimeへsignalを転送しない。
+- readiness evidenceの更新は既存のserver単位cross-process lockを使うため、agentと通常CLIが同時にaccessしても安全。自動restart、通知、health/TPS、crash分類、desired state、複数server監視、event DB、systemd unit生成は対象外。
+
 ## 設定とserver selection
 
 `internal/config`がTOMLを読み、`internal/bootstrap`が選択したserverから`app.Service`を組み立てる。

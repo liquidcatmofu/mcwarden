@@ -182,6 +182,33 @@ func TestStateCommandErrors(t *testing.T) {
 	}
 }
 
+func TestAgentRejectsInvalidArguments(t *testing.T) {
+	for _, args := range [][]string{
+		{"agent", "--interval=0s"},
+		{"agent", "--interval=-1s"},
+		{"agent", "extra"},
+	} {
+		t.Run(join(args), func(t *testing.T) {
+			var out, stderr bytes.Buffer
+			code := Run(context.Background(), args, &out, &stderr, staticService(app.Service{}))
+			if code != 2 || stderr.Len() == 0 {
+				t.Fatalf("code=%d stderr=%s", code, &stderr)
+			}
+		})
+	}
+}
+
+func TestAgentHelpDoesNotLoad(t *testing.T) {
+	load := func(string, string) (app.Service, error) {
+		t.Fatal("loader must not be called")
+		return app.Service{}, nil
+	}
+	var out, stderr bytes.Buffer
+	if code := Run(context.Background(), []string{"agent", "--help"}, &out, &stderr, load); code != 0 {
+		t.Fatalf("code=%d stderr=%s", code, &stderr)
+	}
+}
+
 func TestStateLoaderError(t *testing.T) {
 	load := func(string, string) (app.Service, error) {
 		return app.Service{}, fmt.Errorf("%w: boom", app.ErrConfig)

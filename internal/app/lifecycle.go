@@ -66,8 +66,12 @@ type Result struct {
 }
 
 type Service struct {
-	Runtime   runtime.Runtime
-	Minecraft minecraft.Control
+	// ServerName is the selected server identity. Bootstrap always sets it so
+	// agent events and future notification routing do not have to re-derive the
+	// selection from configuration.
+	ServerName string
+	Runtime    runtime.Runtime
+	Minecraft  minecraft.Control
 	// Observer observes Minecraft readiness for an explicit Runtime generation.
 	// It is separate from the command transport: RCON never proves readiness.
 	Observer minecraft.Observer

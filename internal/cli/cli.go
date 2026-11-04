@@ -11,13 +11,14 @@ import (
 	"strings"
 	"time"
 
+	"github.com/liquidcatmofu/mcwarden/internal/agent"
 	"github.com/liquidcatmofu/mcwarden/internal/app"
 	"github.com/liquidcatmofu/mcwarden/internal/state"
 )
 
 const usage = `Usage: mcwarden [global options] <command> [options]
 
-Commands: status, start, stop, restart, state, version, help
+Commands: status, start, stop, restart, agent, state, version, help
 Global options: -c, --config <path>  -s, --server <name>  --json
 State: state show | state clean
 Start: --start-timeout=120s [--no-wait]
@@ -25,6 +26,7 @@ Stop: --stop-timeout=120s
 Restart: --stop-timeout=120s --term [--term-timeout=30s]
          --kill --force [--kill-timeout=10s]
          --start-timeout=120s [--no-wait]
+Agent: --interval=2s  (streams events; --json emits JSON Lines)
 
 Global options may appear before or after the command.
 Runtime adapters and Minecraft control/readiness are configured through TOML.
@@ -72,6 +74,9 @@ func Run(ctx context.Context, args []string, out, stderr io.Writer, load Loader)
 	}
 	if command == "state" {
 		return runState(ctx, rest[1:], globals, out, stderr, load)
+	}
+	if command == "agent" {
+		return runAgent(ctx, rest[1:], globals, out, stderr, load)
 	}
 	if command != "status" && command != "start" && command != "stop" && command != "restart" {
 		fmt.Fprintf(stderr, "unknown command: %s\n", command)
@@ -160,6 +165,38 @@ func runState(ctx context.Context, args []string, globals globalOptions, out, st
 		}
 	}
 	return output(out, stderr, globals.json, data, err)
+}
+
+// runAgent starts the long-running observation command. Unlike one-shot
+// commands it streams events to stdout and never wraps them in the JSON
+// envelope.
+func runAgent(ctx context.Context, args []string, globals globalOptions, out, stderr io.Writer, load Loader) int {
+	flags := flag.NewFlagSet("agent", flag.ContinueOnError)
+	flags.SetOutput(stderr)
+	interval := flags.Duration("interval", agent.DefaultInterval, "observation and retry interval")
+	if err := flags.Parse(args); err != nil {
+		if err == flag.ErrHelp {
+			return 0
+		}
+		return 2
+	}
+	if flags.NArg() != 0 || *interval <= 0 {
+		fmt.Fprintf(stderr, "agent interval must be positive: %v\n", app.ErrInvalid)
+		return 2
+	}
+	err := agent.Run(ctx, agent.Options{
+		ConfigPath: globals.config,
+		ServerName: globals.server,
+		Interval:   *interval,
+		Loader:     agent.Loader(load),
+		Output:     out,
+		JSON:       globals.json,
+	})
+	if err != nil {
+		fmt.Fprintln(stderr, err)
+		return app.ExitCode(err)
+	}
+	return 0
 }
 
 // output writes either the JSON envelope or the human-readable form and returns

@@ -119,10 +119,21 @@ func ensureDir(dir string) error {
 // Path returns the state file path for this server.
 func (s *Store) Path() string { return filepath.Join(s.dir, s.key()+".json") }
 
-// lockPath prepares the runtime directory and returns the server lock path.
+// lockPath prepares the runtime directory and returns the lifecycle lock path.
 // Only mutating operations take a lock, so read-only state inspection works
 // even when no runtime directory is available.
 func (s *Store) lockPath() (string, error) {
+	return s.runtimeLockPath(".lock")
+}
+
+// agentLockPath prepares the runtime directory and returns the agent lock path.
+// It is separate from the lifecycle lock so an observation-only agent never
+// blocks start, stop, or restart.
+func (s *Store) agentLockPath() (string, error) {
+	return s.runtimeLockPath(".agent.lock")
+}
+
+func (s *Store) runtimeLockPath(suffix string) (string, error) {
 	base, err := runtimeBase()
 	if err != nil {
 		return "", err
@@ -131,7 +142,7 @@ func (s *Store) lockPath() (string, error) {
 	if err := ensureDir(dir); err != nil {
 		return "", err
 	}
-	return filepath.Join(dir, s.key()+".lock"), nil
+	return filepath.Join(dir, s.key()+suffix), nil
 }
 
 // key derives a filename from the server name. Simple names are used as-is;
@@ -337,6 +348,21 @@ func (s *Store) Lock() (*Lock, error) {
 	if err != nil {
 		return nil, err
 	}
+	return lockFile(path)
+}
+
+// LockAgent takes the non-blocking exclusive agent lock for the server. It is
+// independent of the lifecycle lock, so a running agent only prevents another
+// agent for the same server and never blocks mutations.
+func (s *Store) LockAgent() (*Lock, error) {
+	path, err := s.agentLockPath()
+	if err != nil {
+		return nil, err
+	}
+	return lockFile(path)
+}
+
+func lockFile(path string) (*Lock, error) {
 	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o600)
 	if err != nil {
 		return nil, fmt.Errorf("open state lock: %w", err)
@@ -354,6 +380,11 @@ func (s *Store) Lock() (*Lock, error) {
 // LockServer takes the lifecycle lock without opening a process identity store.
 func LockServer(server string) (*Lock, error) {
 	return (&Store{server: server}).Lock()
+}
+
+// LockAgent takes the agent lock without opening a process identity store.
+func LockAgent(server string) (*Lock, error) {
+	return (&Store{server: server}).LockAgent()
 }
 
 // Lock is an acquired server lock. Unlock must be called exactly once.
