@@ -188,12 +188,15 @@ mcwarden -s rail agent
 mcwarden -s rail agent --interval=5s --json
 ```
 
-agentはread-onlyです。Minecraft commandを送らず、Runtimeへsignalも送りません。自動restart、通知、health/TPS、player監視、crash原因分類、desired state、intentional/unexpected exit分類は行いません。`generation_exited`はcrashを意味しません。exit statusが取得できない場合も正常な観測結果として`exit=unknown`を出します。
+agentはread-onlyです。Minecraft commandを送らず、Runtimeへsignalも送りません。自動restart、通知、health/TPS、player監視、crash原因分類、desired state reconciliation、operation history CLIは行いません。`generation_exited`はcrashを意味しません。exit statusが取得できない場合も正常な観測結果として`exit=unknown`を出します。このPRでは`generation_exited`に`classification` (`intentional` / `unexpected` / `unknown`) と `operation` を追加します。`intentional`は対象generationについてMCWardenが保存したaccepted exit intentだけを根拠とし、exit code・signal・readiness・RCON到達性は使いません。`unexpected`はMCWarden accepted exit intentで説明できないexitであり、Minecraft crash確定ではありません。`unknown`はprepared intentまたはledger読取エラーに対応します。
 
 ```text
 2026-11-04T21:30:00+09:00 rail agent_started
 2026-11-04T21:30:00+09:00 rail generation_observed runtime=running minecraft=running
 2026-11-04T22:14:31+09:00 rail generation_exited exit=unknown
+2026-11-04T22:14:31+09:00 rail generation_exited classification=intentional operation=restart exit=0
+2026-11-04T22:14:31+09:00 rail generation_exited classification=unexpected exit=1
+2026-11-04T22:14:31+09:00 rail generation_exited classification=unknown operation=stop exit=unknown
 2026-11-04T22:14:33+09:00 rail generation_observed runtime=running minecraft=starting
 2026-11-04T22:15:02+09:00 rail minecraft_state_changed minecraft=running
 ```
