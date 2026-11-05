@@ -40,7 +40,7 @@ Runtimeの状態取得失敗はエラー。Minecraft側の取得失敗は部分�
 - `-s`省略時は最初のLoader成功までserver名が未解決である。未解決eventは`server` fieldを持たず、`agent_started`は名前解決とagent lock取得後に出す。「server未解決」と空文字のserver名を区別する。
 - stdoutはtext、`--json`は1 event = 1 objectのJSON Lines。単発commandのJSON envelopeとは別契約。password、RCON credential、外部command stderrをeventへ入れない。
 - SIGINT/SIGTERMはcontext cancelとして扱い、`agent_stopped`を出してexit 0。Runtimeへsignalを転送しない。
-- readiness evidenceの更新は既存のserver単位cross-process lockを使うため、agentと通常CLIが同時にaccessしても安全。自動restart、通知、health/TPS、crash分類、desired state、複数server監視、event DB、systemd unit生成は対象外。
+- readiness evidenceの更新は既存のserver単位cross-process lockを使うため、agentと通常CLIが同時にaccessしても安全。自動restart、通知、health/TPS、crash分類、desired state reconciliation、複数server監視、event DB、systemd unit生成は対象外。
 
 ## 設定とserver selection
 
