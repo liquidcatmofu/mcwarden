@@ -82,6 +82,14 @@ type Service struct {
 	StateStore func() (*state.Store, error)
 	// OperationLock serializes lifecycle mutations independently of identity persistence.
 	OperationLock func() (*state.Lock, error)
+	// OperationStore persists desired state and generation-scoped exit intents.
+	// Bootstrap wires Operations instead so constructing a service does not
+	// require the state directory. A nil pair disables persistence for tests and
+	// runtimes without host state.
+	OperationStore *state.OperationStore
+	Operations     func() (*state.OperationStore, error)
+	// ledger is a test seam for the subset of OperationStore used by lifecycle.
+	ledger operationLedger
 }
 
 func (s Service) requireRunning(ctx context.Context) error {
@@ -107,7 +115,7 @@ func (s Service) requireRunning(ctx context.Context) error {
 	}
 }
 
-func (s Service) graceful(ctx context.Context, m *mutation, timeout time.Duration, result *Result) error {
+func (s Service) graceful(ctx context.Context, m *mutation, timeout time.Duration, result *Result, operation state.ExitOperation) error {
 	if err := s.requireRunning(ctx); err != nil {
 		return err
 	}
@@ -124,8 +132,40 @@ func (s Service) graceful(ctx context.Context, m *mutation, timeout time.Duratio
 	if err := ctx.Err(); err != nil {
 		return err
 	}
+
+	// Desired state is the user's requested target, not observed reality. It is
+	// saved before the stop request and is never rolled back on failure.
+	desired := state.DesiredStopped
+	if operation == state.ExitRestart {
+		desired = state.DesiredRunning
+	}
+	if err := s.saveDesired(ctx, desired); err != nil {
+		return err
+	}
+	generation, hasGeneration, err := s.generation(ctx)
+	if err != nil {
+		return fmt.Errorf("runtime generation: %w", err)
+	}
+	hasPrepared := false
+	if hasGeneration {
+		hasPrepared, err = s.prepareExitIntent(ctx, generation, operation)
+		if err != nil {
+			return err
+		}
+	}
 	if err := s.Minecraft.Command(ctx, "stop"); err != nil {
+		if hasPrepared {
+			// Best effort: a leftover prepared intent classifies as unknown,
+			// which is safer than a false intentional result.
+			_ = s.removePreparedExitIntent(ctx, generation, operation)
+		}
 		return fmt.Errorf("minecraft stop: %w", err)
+	}
+	if hasPrepared {
+		// The stop is already delivered. Losing the accepted metadata must not
+		// roll back the lifecycle or prevent a restart from starting the new
+		// generation; classification simply remains unknown.
+		_ = s.acceptExitIntent(ctx, generation, operation)
 	}
 	result.Events = append(result.Events, StopRequested)
 	result.State = minecraft.Stopping
@@ -188,6 +228,9 @@ func (s Service) Start(ctx context.Context, opts StartOptions) (Result, error) {
 	}
 	defer m.release()
 	result.Events = append(result.Events, StartRequested)
+	if err := s.saveDesired(ctx, state.DesiredRunning); err != nil {
+		return result, err
+	}
 	if err := s.startGeneration(ctx, m, readiness); err != nil {
 		return result, err
 	}
@@ -364,7 +407,7 @@ func (s Service) Stop(ctx context.Context, opts StopOptions) (Result, error) {
 		return result, err
 	}
 	defer m.release()
-	err = s.graceful(ctx, m, opts.Timeout, &result)
+	err = s.graceful(ctx, m, opts.Timeout, &result, state.ExitStop)
 	return result, err
 }
 
@@ -404,7 +447,7 @@ func (s Service) Restart(ctx context.Context, opts RestartOptions) (Result, erro
 	if err := prepareReadiness(ctx, readiness); err != nil {
 		return result, err
 	}
-	err = s.graceful(ctx, m, opts.StopTimeout, &result)
+	err = s.graceful(ctx, m, opts.StopTimeout, &result, state.ExitRestart)
 	termUnsupported := false
 	if errors.Is(err, errWaitTimeout) && ctx.Err() == nil && opts.Escalation >= WithTerm {
 		// Only an unsupported Signal(TERM), not an unsupported Wait or any

@@ -25,6 +25,10 @@ type fake struct {
 	termCancel                                         context.CancelFunc
 	noCommand                                          bool
 	cancel                                             context.CancelFunc
+	generation                                         string
+	generationOK                                       bool
+	generationErr                                      error
+	onCommand                                          func()
 }
 
 func (f *fake) State(context.Context) (runtime.State, error) {
@@ -88,10 +92,19 @@ func TestRestartUnsupportedTerminate(t *testing.T) {
 }
 func (f *fake) Command(_ context.Context, command string) error {
 	f.calls = append(f.calls, command)
+	if f.onCommand != nil {
+		f.onCommand()
+	}
 	return f.commandErr
 }
 func (f *fake) Capabilities(context.Context) (minecraft.Capabilities, error) {
 	return minecraft.Capabilities{Command: !f.noCommand}, f.capsErr
+}
+func (f *fake) Generation(ctx context.Context) (string, bool, error) {
+	if err := ctx.Err(); err != nil {
+		return "", false, err
+	}
+	return f.generation, f.generationOK, f.generationErr
 }
 func (f *fake) Wait(ctx context.Context) (runtime.ExitStatus, error) {
 	f.calls = append(f.calls, "wait")

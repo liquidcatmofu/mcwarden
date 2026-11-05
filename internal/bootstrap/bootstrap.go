@@ -60,6 +60,7 @@ func Service(configPath, serverName string) (app.Service, error) {
 		Observer:      observer,
 		RuntimeName:   "direct",
 		OperationLock: func() (*state.Lock, error) { return state.LockServer(name) },
+		Operations:    func() (*state.OperationStore, error) { return state.OpenOperations(name) },
 	}
 	if server.Runtime == "podman" {
 		service.RuntimeName = "podman"

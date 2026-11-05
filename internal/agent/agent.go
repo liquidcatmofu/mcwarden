@@ -48,6 +48,16 @@ type Snapshot struct {
 	Minecraft  minecraft.State
 }
 
+// ExitClassification describes whether a generation's exit is explained by an
+// MCWarden accepted exit intent. It never means "crashed" when unexpected.
+type ExitClassification string
+
+const (
+	ExitIntentional ExitClassification = "intentional"
+	ExitUnexpected  ExitClassification = "unexpected"
+	ExitUnknown     ExitClassification = "unknown"
+)
+
 // Event is the typed agent event stream. It deliberately excludes passwords,
 // RCON credentials, and external command output.
 type Event struct {
@@ -55,13 +65,15 @@ type Event struct {
 	// Server is the selected server name. It is omitted until the name is
 	// resolved, which can only happen after the first successful load when the
 	// CLI did not specify a server.
-	Server     string              `json:"server,omitempty"`
-	Type       string              `json:"type"`
-	Generation string              `json:"generation,omitempty"`
-	Runtime    runtime.State       `json:"runtime,omitempty"`
-	Minecraft  minecraft.State     `json:"minecraft,omitempty"`
-	Exit       *runtime.ExitStatus `json:"exit,omitempty"`
-	Error      string              `json:"error,omitempty"`
+	Server         string              `json:"server,omitempty"`
+	Type           string              `json:"type"`
+	Generation     string              `json:"generation,omitempty"`
+	Runtime        runtime.State       `json:"runtime,omitempty"`
+	Minecraft      minecraft.State     `json:"minecraft,omitempty"`
+	Exit           *runtime.ExitStatus `json:"exit,omitempty"`
+	Classification ExitClassification  `json:"classification,omitempty"`
+	Operation      state.ExitOperation `json:"operation,omitempty"`
+	Error          string              `json:"error,omitempty"`
 }
 
 // Clock and Ticker are injectable so tests do not need to sleep.
@@ -402,12 +414,20 @@ func (a *agent) waitGeneration(ctx context.Context, service app.Service, generat
 				return true, nil
 			}
 			exit := observed.exit
+			classification, operation, classifyErr := a.classifyExit(service, generation)
 			if err := a.emit(Event{
-				Type:       EventGenerationExited,
-				Generation: generation,
-				Exit:       &exit,
+				Type:           EventGenerationExited,
+				Generation:     generation,
+				Exit:           &exit,
+				Classification: classification,
+				Operation:      operation,
 			}); err != nil {
 				return false, err
+			}
+			if classifyErr != nil {
+				if err := a.observationError(classifyErr); err != nil {
+					return false, err
+				}
 			}
 			return false, nil
 		case <-ticker.C():
@@ -462,6 +482,44 @@ func generation(ctx context.Context, rt runtime.Runtime) (string, bool, error) {
 	return generational.Generation(ctx)
 }
 
+// classifyExit reads the operation ledger for the exact generation that exited.
+// Exit status is deliberately ignored: only accepted MCWarden intent makes an
+// exit intentional, and a missing match means "not explained by accepted
+// intent", not "crashed".
+func (a *agent) classifyExit(service app.Service, generation string) (ExitClassification, state.ExitOperation, error) {
+	store := service.OperationStore
+	if store == nil && service.Operations != nil {
+		var err error
+		store, err = service.Operations()
+		if err != nil {
+			return ExitUnknown, "", fmt.Errorf("operation ledger: %w", err)
+		}
+	}
+	if store == nil {
+		return ExitUnexpected, "", nil
+	}
+	rec, exists, err := store.Load()
+	if err != nil {
+		return ExitUnknown, "", fmt.Errorf("operation ledger: %w", err)
+	}
+	if !exists {
+		return ExitUnexpected, "", nil
+	}
+	intent, ok := rec.FindExitIntent(generation)
+	if !ok {
+		return ExitUnexpected, "", nil
+	}
+	switch intent.Phase {
+	case state.IntentAccepted:
+		return ExitIntentional, intent.Operation, nil
+	case state.IntentPrepared:
+		return ExitUnknown, intent.Operation, nil
+	default:
+		// Load validates phases, but never guess intentional from unknown data.
+		return ExitUnknown, "", nil
+	}
+}
+
 func (a *agent) observationError(err error) error {
 	message := err.Error()
 	if a.haveObservationError && a.lastObservationError == message {
@@ -501,7 +559,7 @@ func (a *agent) emit(event Event) error {
 }
 
 func formatEvent(event Event) string {
-	fields := make([]string, 0, 7)
+	fields := make([]string, 0, 9)
 	if !event.Time.IsZero() {
 		fields = append(fields, event.Time.Format(time.RFC3339))
 	}
@@ -514,6 +572,12 @@ func formatEvent(event Event) string {
 	}
 	if event.Minecraft != "" {
 		fields = append(fields, "minecraft="+string(event.Minecraft))
+	}
+	if event.Classification != "" {
+		fields = append(fields, "classification="+string(event.Classification))
+	}
+	if event.Operation != "" {
+		fields = append(fields, "operation="+string(event.Operation))
 	}
 	if event.Exit != nil {
 		fields = append(fields, "exit="+formatExit(*event.Exit))

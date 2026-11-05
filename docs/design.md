@@ -119,3 +119,27 @@ MCWardenが起動・採用した世代の同一性は`internal/state`が永続�
 - `Config.Path`はJVM本体、または最後に`exec java ...`でJVMへ置き換わるwrapperを契約とする。process treeは探索せず、wrapperが先に終了する構成やJVMより長生きする構成は対象外。
 
 DirectProcessアダプターはCLIへ配線済みで、`status`・`start`・`state show`/`state clean`が動作する。保存済みstateからの復元、終了確認後のstate削除、server単位のmutation lockも実装済み。Minecraft RCON Controlとlog readiness observerも配線済みで、`stop`と`restart`がRCON `stop` → `Runtime.Wait` → 新process起動 → readiness観測まで進む。readiness observerを設定しない場合、既定の`start`・`restart`は起動前（restartは停止前）に終了コード5を返す。`kill`のCLI配線はまだ。
+
+## desired state と exit intent（generation-scoped）
+
+MCWardenは3つの概念を分離する。
+
+- desired state: ユーザーが最後に要求した最終状態 (`running` / `stopped`)。実際の現在状態ではなく、失敗しても巻き戻さない。
+- actual state: Runtime/Minecraftから観測した状態。
+- exit intent: 特定generationの終了をMCWardenが要求したという証拠。`stop` / `restart` と `prepared` / `accepted` を持つ。
+
+`desired`は`~/.local/state/mcwarden/operations/<server>.json`の`desired`に保存され、`start`→`running`、`stop`→`stopped`、`restart`→`running`となる。`start`/`stop`/`restart`の失敗後もdesiredは戻さない。
+
+exit intentは`exit_intents` ledgerにgenerationごとに複数保持し、最新64件までpruneする。classificationは必ずgeneration exact matchを要求する。
+
+- `accepted`: Minecraft "stop" commandが`Control.Command`の成功contractを満たした。RCONではauth成功→command packet完全writeまで。
+- `prepared`: stopを実行しようとしていたが、command deliveryは未証明。race安全のため、desired更新→prepared保存→RCON stop→accepted昇格の順で扱う。
+
+agentの`generation_exited`はexit statusとは独立にclassificationを付ける。
+
+- exact generation + `accepted` → `intentional` / `stop|restart`
+- exact generation + `prepared` → `unknown` / `stop|restart`
+- matching generationなし → `unexpected`
+- ledger読取エラー → `generation_exited`自体は保持、`classification=unknown`、`observation_error`を追加出力
+
+`unexpected`は「MCWarden accepted exit intentで説明できないexit」であり、Minecraft crash確定を意味しない。OOM・JVM crash・host shutdown・手動操作・systemd/podman操作なども含み得る。`intentional`判定にexit code、signal種類、Minecraft readiness、RCON到達性、process/container停止理由の推測は絶対に使わない。
